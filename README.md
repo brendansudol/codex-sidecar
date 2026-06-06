@@ -145,3 +145,4 @@ node dist/cli.js --help
 ```
 
 For planned improvements, see [Roadmap Notes](docs/roadmap.md).
+For manual smoke testing, see [Manual Smoke Testing](docs/testing.md).
