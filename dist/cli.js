@@ -42,7 +42,7 @@ const process = __importStar(require("node:process"));
 const APP = "codex-sidecar";
 const STATE_DIR = ".codex-sidecar";
 const DEFAULT_THREAD = "default";
-const UUID_RE = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b/g;
+const UUID_RE = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
 function main(argv) {
     const [cmd, ...rest] = argv;
     try {
@@ -534,7 +534,6 @@ function codexCommand(meta, sessionId) {
         "--cd", meta.repo,
         "--color", "never",
         "--sandbox", meta.sandbox,
-        "--ask-for-approval", meta.approval,
         "--output-last-message", meta.answerPath,
         "--json",
     ];
@@ -546,6 +545,7 @@ function codexCommand(meta, sessionId) {
         cmd.push("--skip-git-repo-check");
     for (const item of meta.codexConfig)
         cmd.push("-c", item);
+    cmd.push("-c", `approval_policy=${JSON.stringify(meta.approval)}`);
     if (!meta.fresh && sessionId)
         cmd.push("resume", sessionId);
     cmd.push("-");

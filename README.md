@@ -127,9 +127,9 @@ By default, the command sent to Codex is shaped like:
 codex exec \
   --cd <repo-root> \
   --sandbox read-only \
-  --ask-for-approval never \
   --output-last-message .codex-sidecar/runs/<id>/answer.md \
   --json \
+  -c approval_policy=\"never\" \
   -
 ```
 
