@@ -1,0 +1,28 @@
+{
+  "name": "codex-sidecar",
+  "version": "0.1.0",
+  "description": "Ask OpenAI Codex for background second opinions from the same repo as Claude Code.",
+  "license": "MIT",
+  "bin": {
+    "codex-sidecar": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsc -w -p tsconfig.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "typescript": "^5.8.3"
+  }
+}
