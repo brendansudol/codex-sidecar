@@ -42,7 +42,7 @@ const process = __importStar(require("node:process"));
 const APP = "codex-sidecar";
 const STATE_DIR = ".codex-sidecar";
 const DEFAULT_THREAD = "default";
-const UUID_RE = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 function main(argv) {
     const [cmd, ...rest] = argv;
     try {
@@ -513,18 +513,19 @@ function runWorker(rdir) {
         answer = `Codex did not write a final answer. Last output follows:\n\n${tailText(meta.stderrPath, 12_000) || tailText(meta.stdoutPath, 12_000)}`;
         fs.writeFileSync(meta.answerPath, answer, "utf8");
     }
-    const parsedSession = parseSessionId([meta.stdoutPath, meta.stderrPath, meta.answerPath]) ?? sessionId;
+    const parsedSession = parseSessionId(meta.stdoutPath);
     const status = code === 0 ? "done" : "failed";
+    const nextSessionId = parsedSession ?? (isResumeFailure(meta) ? undefined : sessionId);
     const latestPath = path.join(stateDir(meta.repo), "latest.md");
     const latest = `# Codex Sidecar Answer\n\n- Run: \`${meta.id}\`\n- Thread: \`${meta.thread}\`\n- Status: \`${status}\`\n- Question: ${meta.question}\n\n---\n\n${answer.trim()}\n`;
     fs.writeFileSync(latestPath, latest, "utf8");
     const nextThread = loadThread(meta.repo, meta.thread);
-    nextThread.sessionId = parsedSession;
+    nextThread.sessionId = nextSessionId;
     nextThread.lastRunId = meta.id;
     nextThread.turns.push({ runId: meta.id, question: meta.question, answerPath: meta.answerPath, answeredAt: nowIso() });
     nextThread.turns = nextThread.turns.slice(-20);
     saveThread(meta.repo, nextThread);
-    updateMeta(rdir, { status, returnCode: code, sessionId: parsedSession, finishedAt: nowIso() });
+    updateMeta(rdir, { status, returnCode: code, sessionId: nextSessionId, finishedAt: nowIso() });
     return code;
 }
 function codexCommand(meta, sessionId) {
@@ -557,16 +558,29 @@ function worker(args) {
         die("worker requires a run directory");
     process.exit(runWorker(rdir));
 }
-function parseSessionId(files) {
-    const found = [];
-    for (const file of files) {
-        if (!fs.existsSync(file))
+function parseSessionId(ndjsonPath) {
+    if (!fs.existsSync(ndjsonPath))
+        return undefined;
+    let id;
+    for (const line of readText(ndjsonPath).split(/\r?\n/)) {
+        if (!line.trim())
             continue;
-        const text = readText(file);
-        for (const match of text.matchAll(UUID_RE))
-            found.push(match[0].toLowerCase());
+        try {
+            const event = JSON.parse(line);
+            const found = event.thread_id ?? event.session_id ?? event.conversation_id;
+            if (typeof found === "string" && UUID_RE.test(found))
+                id = found.toLowerCase();
+        }
+        catch {
+            // Ignore non-JSON lines; Codex JSON output should be JSONL, but logs can be noisy.
+        }
     }
-    return found.at(-1);
+    return id;
+}
+function isResumeFailure(meta) {
+    const stderr = fs.existsSync(meta.stderrPath) ? readText(meta.stderrPath) : "";
+    const answer = fs.existsSync(meta.answerPath) ? readText(meta.answerPath) : "";
+    return /thread\/resume failed|no rollout found for thread id/i.test(`${stderr}\n${answer}`);
 }
 function parseThreadAndRun(args) {
     let thread = DEFAULT_THREAD;

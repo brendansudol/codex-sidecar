@@ -8,7 +8,7 @@ import * as process from "node:process";
 const APP = "codex-sidecar";
 const STATE_DIR = ".codex-sidecar";
 const DEFAULT_THREAD = "default";
-const UUID_RE = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -554,20 +554,21 @@ function runWorker(rdir: string): number {
     fs.writeFileSync(meta.answerPath, answer, "utf8");
   }
 
-  const parsedSession = parseSessionId([meta.stdoutPath, meta.stderrPath, meta.answerPath]) ?? sessionId;
+  const parsedSession = parseSessionId(meta.stdoutPath);
   const status: RunStatus = code === 0 ? "done" : "failed";
+  const nextSessionId = parsedSession ?? (isResumeFailure(meta) ? undefined : sessionId);
   const latestPath = path.join(stateDir(meta.repo), "latest.md");
   const latest = `# Codex Sidecar Answer\n\n- Run: \`${meta.id}\`\n- Thread: \`${meta.thread}\`\n- Status: \`${status}\`\n- Question: ${meta.question}\n\n---\n\n${answer.trim()}\n`;
   fs.writeFileSync(latestPath, latest, "utf8");
 
   const nextThread = loadThread(meta.repo, meta.thread);
-  nextThread.sessionId = parsedSession;
+  nextThread.sessionId = nextSessionId;
   nextThread.lastRunId = meta.id;
   nextThread.turns.push({ runId: meta.id, question: meta.question, answerPath: meta.answerPath, answeredAt: nowIso() });
   nextThread.turns = nextThread.turns.slice(-20);
   saveThread(meta.repo, nextThread);
 
-  updateMeta(rdir, { status, returnCode: code, sessionId: parsedSession, finishedAt: nowIso() });
+  updateMeta(rdir, { status, returnCode: code, sessionId: nextSessionId, finishedAt: nowIso() });
   return code;
 }
 
@@ -597,14 +598,26 @@ function worker(args: string[]): void {
   process.exit(runWorker(rdir));
 }
 
-function parseSessionId(files: string[]): string | undefined {
-  const found: string[] = [];
-  for (const file of files) {
-    if (!fs.existsSync(file)) continue;
-    const text = readText(file);
-    for (const match of text.matchAll(UUID_RE)) found.push(match[0].toLowerCase());
+function parseSessionId(ndjsonPath: string): string | undefined {
+  if (!fs.existsSync(ndjsonPath)) return undefined;
+  let id: string | undefined;
+  for (const line of readText(ndjsonPath).split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      const found = event.thread_id ?? event.session_id ?? event.conversation_id;
+      if (typeof found === "string" && UUID_RE.test(found)) id = found.toLowerCase();
+    } catch {
+      // Ignore non-JSON lines; Codex JSON output should be JSONL, but logs can be noisy.
+    }
   }
-  return found.at(-1);
+  return id;
+}
+
+function isResumeFailure(meta: RunMeta): boolean {
+  const stderr = fs.existsSync(meta.stderrPath) ? readText(meta.stderrPath) : "";
+  const answer = fs.existsSync(meta.answerPath) ? readText(meta.answerPath) : "";
+  return /thread\/resume failed|no rollout found for thread id/i.test(`${stderr}\n${answer}`);
 }
 
 function parseThreadAndRun(args: string[]): { thread: string; run?: string; skipGitCheck: boolean; json: boolean } {
