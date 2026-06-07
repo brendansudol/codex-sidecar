@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as process from "node:process";
+import { BUILTIN_TEMPLATES, DEFAULT_TEMPLATE, parseTemplateFile, renderTemplate, type TemplateDef } from "./templates";
 
 const APP = "codex-sidecar";
 const STATE_DIR = ".codex-sidecar";
@@ -39,6 +40,7 @@ interface RunMeta {
   contextFiles: string[];
   maxClaudeChars: number;
   skipGitCheck: boolean;
+  template?: string;
   workerPid?: number;
   codexPid?: number;
   command?: string[];
@@ -84,6 +86,7 @@ interface AskOptions {
   contextFiles: string[];
   maxClaudeChars: number;
   skipGitCheck: boolean;
+  template?: string;
   question: string;
 }
 
@@ -117,6 +120,9 @@ function main(argv: string[]): void {
         return;
       case "clear":
         clear(rest);
+        return;
+      case "templates":
+        templatesCmd(rest);
         return;
       case "hook":
         hook(rest);
@@ -153,9 +159,11 @@ Usage:
   ${APP} read [-t thread] [--run run-id]
   ${APP} watch [-t thread] [--run run-id]
   ${APP} clear [-t thread] [--hard]
+  ${APP} templates
 
 Ask options:
   -t, --thread <name>          Side conversation name. Default: default
+      --template <name>        Prompt template. Default: review. See: ${APP} templates
       --claude                 Include recent Claude transcript excerpt when available
       --fresh                  Start a new Codex thread instead of resuming this side thread
       --wait                   Run synchronously and print the answer
@@ -358,6 +366,8 @@ function parseAskArgs(args: string[]): AskOptions {
       if (!Number.isFinite(options.maxClaudeChars)) die("--max-claude-chars must be a number");
     } else if (arg === "--skip-git-check") {
       options.skipGitCheck = true;
+    } else if (arg === "--template") {
+      options.template = needValue(args, ++i, arg);
     } else if (arg.startsWith("-")) {
       die(`unknown ask option: ${arg}`);
     } else {
@@ -366,7 +376,9 @@ function parseAskArgs(args: string[]): AskOptions {
   }
   options.question = questionParts.join(" ").trim();
   if (!options.question && !process.stdin.isTTY) options.question = fs.readFileSync(0, "utf8").trim();
-  if (!options.question) die("provide a question, or pipe one on stdin");
+  // When a template is selected, the question may be supplied by the template's defaultQuestion;
+  // that requires repoRoot()/resolveTemplate(), so defer the no-question check to ask().
+  if (!options.question && !options.template) die("provide a question, or pipe one on stdin");
   return options;
 }
 
@@ -381,15 +393,30 @@ function ask(args: string[]): void {
   const opts = parseAskArgs(args);
   const repo = repoRoot(opts.skipGitCheck);
   ensureState(repo);
+  // Resolve the template once (validates name/body/existence before any run dir is created) and
+  // reuse it for both the default question and the rendered prompt. Defaults to `review`.
+  const templateName = opts.template ?? DEFAULT_TEMPLATE;
+  const template = resolveTemplate(repo, templateName);
+  // Compute the template variables once and reuse them for both the default question and the body,
+  // so a single run can't get two different {{date}} values around a UTC midnight boundary.
+  const vars = templateVars(repo, slug(opts.thread));
+  // A selected template may supply the question when the user gave none. Render it through the
+  // same variables as the body so {{repo}}/{{thread}}/{{date}} resolve (and typos error) here too.
+  let question = opts.question;
+  if (!question) {
+    if (!template.defaultQuestion) {
+      die(`template '${templateName}' has no built-in default question; provide a question.`);
+    }
+    question = renderTemplate(template.defaultQuestion, vars);
+  }
   const id = runId(opts.thread);
   const rdir = runDir(repo, id);
-  ensureDir(rdir);
   const meta: RunMeta = {
     id,
     thread: slug(opts.thread),
     repo,
     cwd: process.cwd(),
-    question: opts.question,
+    question,
     status: "queued",
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -409,8 +436,15 @@ function ask(args: string[]): void {
     contextFiles: opts.contextFiles,
     maxClaudeChars: opts.maxClaudeChars,
     skipGitCheck: opts.skipGitCheck,
+    // Record the resolved template name (including the implicit `review`) so `status --json` can
+    // attribute every run, not just ones that passed --template explicitly.
+    template: templateName,
   };
-  fs.writeFileSync(meta.promptPath, buildPrompt(meta), "utf8");
+  // Render the prompt before creating the run directory, so a malformed placeholder fails without
+  // leaving an empty run dir behind. The template is already resolved above; pass it through.
+  const prompt = buildPrompt(meta, template, vars);
+  ensureDir(rdir);
+  fs.writeFileSync(meta.promptPath, prompt, "utf8");
   writeJson(path.join(rdir, "metadata.json"), meta);
   setLatestRun(repo, meta.thread, id);
 
@@ -435,21 +469,66 @@ function ask(args: string[]): void {
   console.log(`Read later with: ${APP} read -t ${meta.thread}`);
 }
 
-function buildPrompt(meta: RunMeta): string {
+const TEMPLATE_NAME_RE = /^[A-Za-z0-9_.-]+$/;
+
+interface ResolvedTemplate extends TemplateDef {
+  name: string;
+  source: "local" | "builtin";
+}
+
+function templatesDir(repo: string): string {
+  return path.join(stateDir(repo), "templates");
+}
+
+// One predicate shared by listing and resolution, so `templates` never advertises a name that
+// `ask --template` rejects. Also the path-traversal guard (rejects '..' and any '/').
+function isValidTemplateName(name: string): boolean {
+  return TEMPLATE_NAME_RE.test(name) && !name.includes("..");
+}
+
+function localTemplateNames(repo: string): string[] {
+  const dir = templatesDir(repo);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((f) => f.endsWith(".md"))
+    .map((f) => f.replace(/\.md$/, ""))
+    .filter(isValidTemplateName);
+}
+
+function listTemplateNames(repo: string): string[] {
+  return [...new Set([...Object.keys(BUILTIN_TEMPLATES), ...localTemplateNames(repo)])].sort();
+}
+
+// The single source of truth for which template variables exist. Templates may reference any of
+// these as {{name}}; renderTemplate errors on anything else.
+function templateVars(repo: string, thread: string): Record<string, string> {
+  return { repo, thread, date: nowIso().slice(0, 10) };
+}
+
+function resolveTemplate(repo: string, name: string): ResolvedTemplate {
+  // Validate before touching the filesystem: reject path traversal via the local template path.
+  if (!isValidTemplateName(name)) {
+    die(`invalid template name '${name}'. Allowed: letters, digits, '_', '.', '-' (no slashes or '..').`);
+  }
+  // Match a local template only by exact-case directory entry (via localTemplateNames), so
+  // resolution agrees with the listing and a case-variant file on a case-insensitive filesystem
+  // cannot silently override a built-in.
+  if (localTemplateNames(repo).includes(name)) {
+    const localPath = path.join(templatesDir(repo), `${name}.md`);
+    const parsed = parseTemplateFile(readText(localPath));
+    if (!parsed.body.trim()) die(`template '${name}' at ${localPath} has an empty body`);
+    return { name, source: "local", ...parsed };
+  }
+  const builtin = BUILTIN_TEMPLATES[name];
+  if (builtin) return { name, source: "builtin", ...builtin };
+  die(`unknown template '${name}'. Available: ${listTemplateNames(repo).join(", ")}`);
+}
+
+function buildPrompt(meta: RunMeta, template: ResolvedTemplate, vars: Record<string, string>): string {
   const repo = meta.repo;
   const thread = loadThread(repo, meta.thread);
   const chunks: string[] = [];
-  chunks.push(`You are OpenAI Codex acting as a background second-opinion reviewer for a developer using Claude Code.
-
-Repository root: ${repo}
-Side thread: ${meta.thread}
-
-Instructions:
-- Inspect the repository as needed.
-- Give a candid second opinion, not automatic agreement.
-- Prefer concrete evidence from files, commands, diffs, and tests.
-- Do not edit files unless the user explicitly requested write-mode work.
-- Keep the final answer structured and actionable: verdict, evidence, risks, next steps.`);
+  chunks.push(renderTemplate(template.body, vars));
 
   const git = gitContext(repo);
   if (git) chunks.push(`# Current git context\n${git}`);
@@ -735,6 +814,27 @@ function clear(args: string[]): void {
   console.log(`Cleared Codex sidecar thread '${slug(thread)}'${hard ? " and run artifacts" : ""}.`);
 }
 
+function templatesCmd(args: string[]): void {
+  let skipGitCheck = false;
+  for (const arg of args) {
+    if (arg === "--skip-git-check") skipGitCheck = true;
+    else die(`unknown templates option: ${arg}`);
+  }
+  const repo = repoRoot(skipGitCheck);
+  const local = new Set(localTemplateNames(repo));
+  const names = listTemplateNames(repo);
+  for (const name of names) {
+    const isLocal = local.has(name);
+    const isBuiltin = name in BUILTIN_TEMPLATES;
+    const def: TemplateDef = isLocal
+      ? parseTemplateFile(readText(path.join(templatesDir(repo), `${name}.md`)))
+      : BUILTIN_TEMPLATES[name];
+    const tag = isLocal && isBuiltin ? "  (overrides built-in)" : isLocal ? "  (local)" : "";
+    const note = def.defaultQuestion ? " [standalone]" : "";
+    console.log(`${name.padEnd(18)} ${def.description ?? ""}${note}${tag}`);
+  }
+}
+
 function init(args: string[]): void {
   let installClaude = false;
   let skipGitCheck = false;
@@ -786,7 +886,7 @@ function skillMarkdown(): string {
   return `---
 name: codex-opinion
 description: Ask OpenAI Codex for a repo-aware second opinion in the background. Use for plan review, bug-hypothesis checks, PR-style diff review, migration risk, security/authorization skepticism, and follow-up questions to the same side thread.
-allowed-tools: Bash(codex-sidecar ask *), Bash(codex-sidecar read *), Bash(codex-sidecar status *), Bash(codex-sidecar watch *), Bash(codex-sidecar clear *), Read(.codex-sidecar/latest.md), Read(.codex-sidecar/runs/*/answer.md)
+allowed-tools: Bash(codex-sidecar ask *), Bash(codex-sidecar read *), Bash(codex-sidecar status *), Bash(codex-sidecar watch *), Bash(codex-sidecar clear *), Bash(codex-sidecar templates *), Read(.codex-sidecar/latest.md), Read(.codex-sidecar/runs/*/answer.md)
 ---
 
 # Codex Opinion
@@ -799,6 +899,7 @@ Default behavior:
 - For \`status\`, run \`codex-sidecar status\`.
 - For \`watch\`, run \`codex-sidecar watch\`.
 - For \`clear\`, run \`codex-sidecar clear\`.
+- To reuse a common prompt shape, pass \`--template <name>\` (e.g. \`codex-sidecar ask --template diff-review\`); run \`codex-sidecar templates\` to see the available ones. Built-ins: review (default), plan-review, diff-review, bug-hypothesis.
 - Prefer targeted skeptical prompts. Do not blindly defer to Codex; compare its evidence with your own.
 `;
 }
