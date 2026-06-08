@@ -196,3 +196,16 @@ Troubleshooting:
 - If Claude does not find `/codex-opinion`, reload Claude Code.
 - If hooks do not run, verify `.claude/settings.local.json` and make sure Claude Code can resolve `codex-sidecar` on its `PATH`.
 - If `--claude` prompts say no transcript was captured, trigger a new prompt in Claude Code and rerun `codex-sidecar doctor`.
+
+## 9. Codex Loop Gate
+
+Run `npm test` from this repository first. It covers the pure loop helpers with Node's built-in test runner.
+
+Manual loop smoke tests should use a temporary Git repository and a fake `codex` binary on `PATH` that writes canned JSON to the `--output-last-message` path. Verify:
+
+- No active loop makes `codex-sidecar loop hook stop` write no stdout.
+- A failed `--check` blocks before invoking Codex.
+- A fake `PASS` review allows stop and marks `.codex-sidecar/loop.json` as `passed`.
+- A fake `REVISE` review blocks with valid Stop-hook JSON.
+- A fake `HUMAN` review blocks once, then `codex-sidecar hook` on `UserPromptSubmit` reactivates the loop.
+- Invalid review JSON marks the loop `error`, fail-open by default, and blocks only with `--fail-closed`.

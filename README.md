@@ -81,6 +81,26 @@ Run synchronously:
 codex-sidecar ask --wait --claude "Review the current diff as a PR reviewer."
 ```
 
+## Codex loop gate
+
+For higher-risk work, start an opt-in loop that blocks Claude Code's Stop hook until configured checks and a structured Codex review pass:
+
+```bash
+codex-sidecar init --install-claude --install-loop-hook
+codex-sidecar loop start --mode implement --check "npm run check" fix the auth middleware bug
+codex-sidecar loop review
+codex-sidecar loop read
+codex-sidecar loop stop
+```
+
+Plan-only loops review a stable plan file before code is written:
+
+```bash
+codex-sidecar loop start --mode plan --plan-file .codex-sidecar/plan.md add team notification settings
+```
+
+Loop mode is fail-open by default on Codex infrastructure errors; pass `--fail-closed` when the gate should block on review failures/timeouts.
+
 For more concrete usage patterns, see [Codex Sidecar Workflows](docs/workflows.md).
 
 ## Claude Code usage
@@ -100,6 +120,8 @@ Claude should call `codex-sidecar ask --claude ...`, continue working, and later
   latest.md
   latest-default
   claude-session.json
+  loop.json
+  loop/latest-review.md
   threads/default.json
   runs/<run-id>/
     metadata.json
