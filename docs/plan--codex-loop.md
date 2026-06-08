@@ -55,8 +55,11 @@ Prefer a small, robust first version:
   the loop does not want. See "Shared run-path refactor" below.
 - The loop's prompt builder is composition, not greenfield: it reuses `redact`, `truncate`,
   `gitContext`, `claudeContext`, plus the new `gitDiffFull`. No reinventing redaction/truncation.
-- Keep everything in the single `src/cli.ts` file — no module split yet, and no test-runner
-  dependency. Verify with the manual smoke tests in the test plan as we build.
+- Keep everything in the single `src/cli.ts` file — no module split yet, and no third-party
+  test-runner dependency. Cover the pure helpers (command construction, hook decisions, hashes,
+  untracked capture, schema/fence parsing, check/time-budget behavior) with Node's built-in
+  `node:test` (Node 20+, already required by `engines`); walk the stateful hook scenarios with the
+  manual smoke tests in the test plan as we build.
 - Stop hook install is explicit: `init --install-claude --install-loop-hook`.
 - Fail-open by default; `--fail-closed` is opt-in.
 
@@ -308,6 +311,10 @@ interface StopHookInput {
   permission_mode?: string
   hook_event_name?: "Stop" | string
   stop_hook_active?: boolean
+  // Provided by Claude Code's current Stop hook (verified against the hooks docs), along with
+  // `background_tasks` / `session_crons` (v2.1.145+). Prefer this field; fall back to deriving the
+  // latest assistant message from `transcript_path` only for older Claude builds that omit it.
+  // See `resolveLastAssistantMessage` in "Loop prompt builder".
   last_assistant_message?: string
   background_tasks?: Array<{
     id?: string
@@ -479,7 +486,8 @@ Decision rules:
 - If `planFile` is missing and not required, first version may simply block with a clear local
   message asking Claude to create it.
 - Do not require git diff changes.
-- Artifact hash is `hash(planFileContents + lastAssistantMessage + criteria + task)`.
+- Artifact hash is `hash(planFileContents)` only — see "No-progress and cap behavior" for why the
+  latest assistant message, criteria, and task are deliberately excluded from the hash.
 - Checks are skipped by default; if provided, run them, but do not require checks for plan mode
   unless they fail.
 - On `PASS`, mark `status=passed` and allow stop.
@@ -549,30 +557,134 @@ Decision rules:
 
 ### Full diff helper
 
-Plain text diff only — no `--binary` (binary patches are useless to a reviewer and would consume
-the truncation budget):
+The existing `runQuiet` (cli.ts:196) is `runQuiet(command, args, cwd?)` — it takes no options and
+no `maxBuffer`, so it inherits Node's 1 MB `spawnSync` default. A diff over 1 MB would make
+`spawnSync` set `result.error` (`ENOBUFS`) and truncate stdout, so `gitDiffFull` would silently
+return a partial/empty diff on exactly the large changes where review matters most. Add a small
+sibling `runCapture` that raises the buffer and surfaces the error (rather than reshaping
+`runQuiet`, whose 3 existing callers — `gitRoot`, `gitContext`, `doctor` — would all have to change):
 
 ```ts
+function runCapture(
+  command: string,
+  args: string[],
+  opts: { cwd: string; maxBuffer?: number },
+): { status: number | null; stdout: string; stderr: string; error?: Error } {
+  const r = spawnSync(command, args, {
+    cwd: opts.cwd,
+    encoding: "utf8",
+    maxBuffer: opts.maxBuffer ?? 64 * 1024 * 1024,
+  })
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "", error: r.error }
+}
+```
+
+Plain text diff only — no `--binary` (binary patches are useless to a reviewer and would consume
+the truncation budget). Secret-looking paths are excluded at the git layer *before* the content ever
+reaches the prompt (path-level exclusion first, `redact` as the best-effort second line):
+
+```ts
+// First line of defence: keep secret-looking files out of every diff and untracked capture.
+const SECRET_PATHSPECS = [
+  ":(exclude).env",
+  ":(exclude).env.*",
+  ":(exclude)**/.env",
+  ":(exclude)**/.env.*",
+  ":(exclude)**/*.pem",
+  ":(exclude)**/*.key",
+  ":(exclude)**/id_rsa*",
+  ":(exclude)**/*.p12",
+  ":(exclude)**/*.pfx",
+  ":(exclude)**/secrets/**",
+]
+
 function gitDiffFull(repo: string): string {
-  const unstaged = runCapture("git", ["diff"], { cwd: repo, maxBuffer: 10_000_000 })
-  const staged = runCapture("git", ["diff", "--cached"], { cwd: repo, maxBuffer: 10_000_000 })
+  const unstaged = runCapture("git", ["diff", "--", ".", ...SECRET_PATHSPECS], { cwd: repo, maxBuffer: 16_000_000 })
+  const staged = runCapture("git", ["diff", "--cached", "--", ".", ...SECRET_PATHSPECS], { cwd: repo, maxBuffer: 16_000_000 })
+  const untracked = gitUntrackedText(repo)
+  // Fall back to a summary if either capture failed (e.g. ENOBUFS on a huge diff) so the reviewer
+  // never silently gets a truncated/empty diff. Untracked content is still included.
+  if (unstaged.error || staged.error || unstaged.status !== 0 || staged.status !== 0) {
+    // The fallback must apply the same exclusions, or secret *filenames* leak via the summary even
+    // when the full-diff path correctly dropped their contents.
+    const stat = runCapture("git", ["diff", "--stat", "--", ".", ...SECRET_PATHSPECS], { cwd: repo })
+    const names = runCapture("git", ["diff", "--name-status", "--", ".", ...SECRET_PATHSPECS], { cwd: repo })
+    return truncate(
+      redact(
+        [
+          "# Full diff unavailable (too large or git error); summary only.",
+          "# diff --stat",
+          stat.stdout,
+          "# diff --name-status",
+          names.stdout,
+          untracked,
+        ].join("\n\n"),
+      ),
+      60_000,
+    )
+  }
   return truncate(
-    redact(["# Unstaged diff", unstaged.stdout, "# Staged diff", staged.stdout].join("\n\n")),
+    redact(
+      ["# Unstaged diff", unstaged.stdout, "# Staged diff", staged.stdout, untracked].join("\n\n"),
+    ),
     60_000,
   )
 }
 ```
 
-If the diff exceeds limits or a command fails, fall back to `git diff --stat` +
-`git diff --name-status` and note that the full diff was truncated or unavailable. Reuse the
-existing `redact` (cli.ts:890) and `truncate` (cli.ts:883) helpers.
+Untracked files never appear in `git diff` / `git diff --cached`, yet new files are the most common
+— and highest-value — artifact in an implementation loop. Capturing only `git status` would show the
+filenames but not their content, so Codex could not review the new code, and the artifact hash would
+not move when Claude *only* adds files (falsely tripping the no-progress short-circuit). Capture the
+text with size, binary, and secret filters:
+
+```ts
+function gitUntrackedText(repo: string): string {
+  const list = runCapture(
+    "git",
+    ["ls-files", "--others", "--exclude-standard", "-z", "--", ".", ...SECRET_PATHSPECS],
+    { cwd: repo },
+  )
+  if (list.error || list.status !== 0) return "# Untracked files: capture failed."
+  const files = list.stdout.split("\0").filter(Boolean)
+  if (files.length === 0) return "# Untracked files: none."
+  const MAX_FILE_BYTES = 256 * 1024
+  const parts: string[] = ["# Untracked (new) files"]
+  for (const rel of files.slice(0, 100)) {
+    try {
+      const stat = fs.statSync(path.join(repo, rel))
+      if (!stat.isFile()) continue
+      if (stat.size > MAX_FILE_BYTES) {
+        parts.push(`## ${rel}\n<skipped: ${stat.size} bytes exceeds ${MAX_FILE_BYTES}>`)
+        continue
+      }
+      const buf = fs.readFileSync(path.join(repo, rel))
+      if (buf.includes(0)) {
+        parts.push(`## ${rel}\n<skipped: binary>`)
+        continue
+      }
+      parts.push(`## ${rel}\n${buf.toString("utf8")}`)
+    } catch {
+      parts.push(`## ${rel}\n<skipped: unreadable>`)
+    }
+  }
+  if (files.length > 100) parts.push(`# (${files.length - 100} more untracked files omitted)`)
+  return parts.join("\n\n")
+}
+```
+
+The whole assembled string still passes through `redact` in `gitDiffFull`, so untracked content is
+redacted too. Reuse the existing `redact` (cli.ts:890) and `truncate` (cli.ts:883) helpers.
 
 ### Implementation behavior
 
 - Run configured checks before Codex.
 - If any check fails, increment round, save output, and block without calling Codex.
 - If checks pass, call Codex with the full diff and schema.
-- Artifact hash is `hash(diff + stagedDiff + checkResults + lastAssistantMessage)`.
+- Artifact hash is `hash(unstagedDiff + stagedDiff + untrackedFileContents)` — optionally plus a
+  *normalized* check projection (`command + exitCode + timedOut` only, never `durationMs` or output
+  tails). Untracked content **must** be in the hash, or adding a new file reads as no progress. The
+  latest assistant message is deliberately excluded — see "No-progress and cap behavior".
 - On `PASS`, mark `status=passed` and allow stop.
 - On `REVISE`, block with concise feedback.
 - On `HUMAN`, same `awaiting_human` flow as plan mode.
@@ -593,7 +705,7 @@ async function handleStopHook(input: StopHookInput): Promise<void> {
 
   if (loop.sessionId && input.session_id && loop.sessionId !== input.session_id) return allow()
 
-  if (hasRunningBackgroundTasks(input)) return allow()
+  if (sessionPausedForLaterWork(input)) return allow()
 
   if (loop.round >= loop.maxRounds) {
     updateLoop({ ...loop, status: "exhausted" })
@@ -607,10 +719,14 @@ async function handleStopHook(input: StopHookInput): Promise<void> {
     )
   }
 
+  // CLI owns the time budget (see "Hook registration"). Deadline computed once at hook entry; checks
+  // and the review each get min(theirTimeout, remaining). Exhaustion → internal-timeout ERROR.
+  const deadline = new Deadline(loop)
+
   const checkResults =
     loop.mode === "implement"
-      ? await runChecks(repo, loop.checks, loop.checkTimeoutSec)
-      : await runOptionalPlanChecks(repo, loop.checks, loop.checkTimeoutSec)
+      ? await runChecks(repo, loop.checks, loop.checkTimeoutSec, deadline)
+      : await runOptionalPlanChecks(repo, loop.checks, loop.checkTimeoutSec, deadline)
 
   const failed = checkResults.filter((r) => r.exitCode !== 0 || r.timedOut)
   if (failed.length > 0) {
@@ -631,7 +747,7 @@ async function handleStopHook(input: StopHookInput): Promise<void> {
     return applyNoProgress(repo, loop)
   }
 
-  const review = await runCodexLoopReview(repo, loop, input, checkResults)
+  const review = await runCodexLoopReview(repo, loop, input, checkResults, deadline)
   return applyReview(repo, loop, review, artifactHash)
 }
 ```
@@ -644,6 +760,23 @@ async function handleStopHook(input: StopHookInput): Promise<void> {
 
 `allow()` writes nothing to stdout and exits 0.
 
+`sessionPausedForLaterWork(input)` returns true when the session is not really finishing but is
+paused waiting for work to wake it back up. Per the hooks docs, that signal is **both**
+`background_tasks` and `session_crons` (v2.1.145+) — either a running/queued background task **or** a
+scheduled cron means "paused," not "done":
+
+```ts
+function sessionPausedForLaterWork(input: StopHookInput): boolean {
+  const tasks = Array.isArray(input.background_tasks) ? input.background_tasks : []
+  const crons = Array.isArray(input.session_crons) ? input.session_crons : []
+  const taskActive = tasks.some((t) => t?.status !== "completed" && t?.status !== "failed")
+  return taskActive || crons.length > 0
+}
+```
+
+Gating a session that is only paused for later work would block the wrong thing, so allow the stop in
+that case and let the loop evaluate on the *real* finish.
+
 ## No-progress and cap behavior — one counter
 
 A single `stuckRounds` counter, incremented by either no-progress signal and reset only on real
@@ -651,12 +784,34 @@ progress:
 
 ```text
 artifactHash:
-  plan mode:           hash(plan file + latest assistant message + criteria + task)
-  implementation mode: hash(full diff + staged diff + check results + latest assistant message)
+  plan mode:           hash(plan file contents)
+  implementation mode: hash(unstaged diff + staged diff + untracked file contents
+                            [+ normalized check projection: command + exitCode + timedOut])
 
 blockerFingerprint:
   hash(normalized blocker titles + evidence + instructions)
 ```
+
+The artifact hash must represent **only the reviewable artifact** — what Claude actually changed —
+not per-run noise:
+
+- **Exclude `durationMs` and `stdoutTail` / `stderrTail` from the hash.** They carry timings and
+  timestamps, so a raw `CheckResult` makes the hash change every run even when nothing changed,
+  silently defeating the no-progress short-circuit and the same-artifact `stuckRounds` path. If
+  check results are hashed at all, hash only a normalized projection (`command + exitCode +
+  timedOut`).
+- **Exclude `lastAssistantMessage` from the hash.** Claude emits a new assistant message every turn
+  (even "I've addressed the feedback"), so including it changes the hash every round regardless of
+  whether the diff/plan moved — the same silent defeat as above. It still belongs in the *prompt*
+  (for review quality), just not the hash.
+- **Exclude the constant `criteria` / `task`** — they do not change within a loop, so they add
+  nothing to a change-detection hash.
+
+Design decision (state it, don't bake it in silently): because `lastAssistantMessage` is out of the
+hash, a pure rebuttal with no artifact change hits the no-progress short-circuit and counts toward
+`stuckRounds` (→ escalates after 2 rounds) instead of re-running Codex on the new argument. This is
+intended: if Claude will not change the artifact and only argues, the loop escalates to the human
+via the `stuck` path — that is the disagreement escape hatch, not a bug.
 
 Rules:
 
@@ -934,11 +1089,15 @@ pointers. A `saveReviewArtifacts` helper (referenced in "Applying reviews") crea
 
 ### Loop review execution
 
-The loop review therefore: builds its prompt (composition — see below), writes `schema.json`,
-constructs a `CodexInvocation` with `outputSchemaPath = schemaPath` and `answerPath = reviewJsonPath`,
-calls `runCodex(codexCommand(inv), prompt, repo, loop.reviewTimeoutSec * 1000)`, persists
-`stdout → codex.ndjson` / `stderr → stderr.txt`, parses `review.json` against the schema, and saves
-artifacts. Sandbox stays `read-only` by default; no `resume`.
+`runCodexLoopReview(repo, loop, input, checkResults, deadline)` therefore: builds its prompt
+(composition — see below), writes `schema.json`, constructs a `CodexInvocation` with
+`outputSchemaPath = schemaPath` and `answerPath = reviewJsonPath`, and calls
+`runCodex(codexCommand(inv), prompt, repo, deadline.remainingMs(loop.reviewTimeoutSec * 1000))` — the
+review timeout capped by the time the checks already consumed, **not** a fixed
+`reviewTimeoutSec * 1000` — so the synchronous review can never push the hook past the budget. If the
+deadline is already exhausted, skip the spawn and return an internal-timeout `ERROR` review. It then
+persists `stdout → codex.ndjson` / `stderr → stderr.txt`, parses `review.json` against the schema,
+and saves artifacts. Sandbox stays `read-only` by default; no `resume`.
 
 ### Loop prompt builder
 
@@ -947,9 +1106,53 @@ not by reimplementing them:
 
 - `redact` (cli.ts:890) on every transcript/diff/file body before it enters the prompt.
 - `truncate` (cli.ts:883) for size budgets.
-- `gitContext` (cli.ts:483) for `{gitStatus}`.
+- `gitContext` (cli.ts:483) for `{gitStatus}`. Note it shells out to `git status`/`git diff
+  --name-only`/`--stat` **without** `SECRET_PATHSPECS`, so it still surfaces secret-looking
+  *filenames* (not contents). Either pass `git`-pathspec exclusions through `gitContext` for the loop
+  caller, or post-filter its output against `SECRET_PATHSPECS` before it enters the prompt — keep it
+  consistent with `gitDiffFull` rather than leaking via the status block.
 - `claudeContext` (cli.ts:501) for the `{claudeContext}` transcript excerpt (skipped when `--blind`).
 - the new `gitDiffFull` for `{gitDiffFull}` in implementation mode.
+- the new `resolveLastAssistantMessage` for `{lastAssistantMessage}` (see below).
+
+`{lastAssistantMessage}` comes from the hook input: Claude Code's current Stop hook **does** include
+`last_assistant_message` (and `background_tasks` / `session_crons`, v2.1.145+). Use the field as the
+primary source — redacted and length-bounded like any other prompt input — and fall back to deriving
+it from `transcript_path` (the JSONL transcript) via the existing `flattenJson` (cli.ts:518)
+machinery only for older Claude builds that did not send the field:
+
+```ts
+function resolveLastAssistantMessage(input: StopHookInput): string {
+  // Primary: the hook field (present on current Claude Code). Redact + bound it — it can be large
+  // and may carry secrets, exactly like the transcript-derived fallback below.
+  if (input.last_assistant_message?.trim()) {
+    return truncate(redact(input.last_assistant_message), 8_000)
+  }
+  // Fallback for older Claude builds that omit the field: scan the JSONL transcript tail.
+  const p = input.transcript_path
+  if (!p || !fs.existsSync(p)) return ""
+  // Scan the JSONL transcript tail for the most recent assistant turn's text.
+  const lines = tailText(p, 200_000).split(/\r?\n/).filter(Boolean)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i]) as Record<string, unknown>
+      const role = (entry.role ?? (entry.message as Record<string, unknown> | undefined)?.role)
+      if (role === "assistant") {
+        const text = flattenJson(entry.message ?? entry.content ?? entry).trim()
+        if (text) return truncate(redact(text), 8_000)
+      }
+    } catch {
+      // ignore non-JSON lines
+    }
+  }
+  return ""
+}
+```
+
+If it returns `""`, the prompt should say so explicitly (e.g. "No assistant message captured.")
+rather than leaving the field blank, so Codex does not treat the absence as meaningful. The exact
+transcript entry shape should be confirmed against a real transcript during the manual hook tests —
+adjust the `role` / `message` extraction if Claude's JSONL nests differently.
 
 ## Hook registration
 
@@ -965,7 +1168,7 @@ existing `mergeHook`, cli.ts:770):
           {
             "type": "command",
             "command": "codex-sidecar loop hook stop",
-            "timeout": 900
+            "timeout": 3600
           }
         ]
       }
@@ -974,10 +1177,68 @@ existing `mergeHook`, cli.ts:770):
 }
 ```
 
-`Stop` has no matcher support, so omit the matcher (the existing `mergeHook` tolerates a `"*"`
-matcher if its shape requires one). Keep the existing SessionStart / UserPromptSubmit capture
-hooks, and extend the `UserPromptSubmit` path to flip an `awaiting_human` loop back to `active`
-when the user replies.
+`mergeHook` (cli.ts:770) cannot express this entry as written: it hardcodes
+`const hook = { type: "command", command }` (no `timeout`) and always writes
+`{ matcher, hooks: [...] }`, deduping on `entry.matcher`. It must be extended before it can install
+the Stop hook:
+
+```ts
+function mergeHook(
+  hooks: Record<string, Json>,
+  event: string,
+  matcher: string | undefined,
+  command: string,
+  timeout?: number,
+): void {
+  const current = Array.isArray(hooks[event]) ? (hooks[event] as Json[]) : []
+  const asObj = current as Array<Record<string, Json>>
+  // When matcher is undefined (Stop has no matcher support), match/dedup on command instead.
+  const existing =
+    matcher === undefined
+      ? asObj.find((e) => Array.isArray(e.hooks) && (e.hooks as Json[]).some(
+          (h) => (h as Record<string, Json>).command === command))
+      : asObj.find((e) => e.matcher === matcher)
+  const hook: Record<string, Json> = timeout === undefined
+    ? { type: "command", command }
+    : { type: "command", command, timeout }
+  if (existing) {
+    const list = Array.isArray(existing.hooks) ? (existing.hooks as Json[]) : []
+    if (!list.some((item) => JSON.stringify(item) === JSON.stringify(hook))) list.push(hook)
+    existing.hooks = list
+  } else {
+    asObj.push(matcher === undefined ? { hooks: [hook] } : { matcher, hooks: [hook] })
+  }
+  hooks[event] = asObj as unknown as Json
+}
+```
+
+The two existing capture calls keep passing a matcher (`mergeHook(hooks, "SessionStart", "...", cmd)`);
+the loop call passes `mergeHook(hooks, "Stop", undefined, "codex-sidecar loop hook stop", 3600)`.
+Omitting the matcher key is safer than writing a stray `"*"` — per the hooks docs `Stop` has no
+matcher support.
+
+**The hook `timeout` and the loop's own time budget must be reconciled — this is load-bearing.** The
+gate runs checks *and then* Codex *synchronously* inside the Stop hook. Checks are repeatable and
+default to 300s **each** (`--check-timeout`), and the review defaults to 600s (`--review-timeout`),
+so the worst case is easily `n × checkTimeoutSec + reviewTimeoutSec` seconds — two checks plus a
+review already exceed a fixed `900`. If Claude Code kills the hook first, the gate fail-opens on
+exactly the rounds doing the most work and never actually gates.
+
+The CLI — not the editor — must own the budget (same stance as not relying on the 8-block backstop):
+
+- Install a *generous* hook timeout (`3600`) purely as a safety net, large enough that the editor
+  effectively never wins the race against a correctly-configured loop.
+- Enforce an **internal remaining-time budget** inside the hook: compute a deadline at hook entry,
+  pass the remaining time into `runChecks` (per-check `min(checkTimeoutSec, remaining)`) and
+  `runCodexLoopReview` (`min(reviewTimeoutSec, remaining)`), and treat budget exhaustion as an
+  internal timeout → `ERROR` (fail-open unless `failClosed`). This makes the CLI authoritative on
+  timing regardless of the editor's configured value.
+- Validate at `loop start`: reject (or clamp with a warning) timeout settings whose worst case
+  (`maxRounds`-independent: `checks.length × checkTimeoutSec + reviewTimeoutSec` plus margin) would
+  exceed the installed hook timeout, so the inconsistency is caught up front, not mid-review.
+
+Keep the existing SessionStart / UserPromptSubmit capture hooks, and extend the `UserPromptSubmit`
+path to flip an `awaiting_human` loop back to `active` when the user replies.
 
 ## Claude skill
 
@@ -1026,6 +1287,13 @@ Commands:
 - `--check` commands run with `shell: true` (users expect shell syntax); document that checks are
   trusted local commands.
 - Reuse `redact` (cli.ts:890) before including any transcript or diff context.
+- Exclude secret-looking paths at the git layer *before* prompt assembly — pass `:(exclude)`
+  pathspecs (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `**/secrets/**`, …) to both the diff and
+  the untracked-file capture (`SECRET_PATHSPECS`, see "Full diff helper"). Path-level exclusion is
+  the first line of defence; `redact` is the best-effort second line, not a substitute. This matters
+  more once untracked capture is added — new files have never been screened by anyone.
+- Untracked capture must filter by size and skip binary files (NUL-byte sniff) so a stray large
+  artifact or binary blob cannot blow the prompt budget.
 - Do not include `.env`, private keys, auth files, large binary blobs, or unbounded logs in prompts.
 - Keep the Codex sandbox `read-only` by default; mention `danger-full-access` only as a warning.
 
@@ -1061,10 +1329,16 @@ cheaply.
 1. Add state helpers for `.codex-sidecar/loop.json` and review artifacts.
 2. Add `loop start / status / read / stop`.
 3. Add plan-file support and default plan criteria.
-4. Add the check runner with timeout and output tails.
-5. Add the `gitDiffFull` helper (plain diff, redaction, truncation; `--stat`/`--name-status` fallback).
-6. Add artifact-hash and blocker-fingerprint helpers.
-7. Add prompt builders for plan and implementation modes.
+4. Add the check runner with per-check timeout and output tails, plus the internal remaining-time
+   budget (deadline computed at hook entry, threaded into checks and the review).
+5. Add the `runCapture` (buffer-raising, error-surfacing), `gitUntrackedText` (size/binary/secret
+   filtered), and `gitDiffFull` helpers (plain diff, `SECRET_PATHSPECS` `:(exclude)` exclusions,
+   untracked capture, redaction, truncation; `--stat`/`--name-status` fallback on `ENOBUFS`/git
+   error).
+6. Add artifact-hash (artifact-only — implement-mode hash covers unstaged + staged + untracked file
+   contents; no `lastAssistantMessage`, no `durationMs`/tails) and blocker-fingerprint helpers.
+7. Add prompt builders for plan and implementation modes, plus `resolveLastAssistantMessage`
+   (hook-field primary, transcript-derived fallback for older Claude builds).
 8. Refactor `codexCommand` to take a `CodexInvocation` spec (decoupled from `RunMeta`); extract
    `runCodex` (the `spawnSync` core, optional timeout) from `runWorker`; rewire `runWorker` onto
    both. Then add the `LoopReview` schema, the loop-local `saveReviewArtifacts` helper, and the
@@ -1072,27 +1346,48 @@ cheaply.
 9. Add the `loop review` manual path (exit codes 0/1/2).
 10. Add the `loop hook stop` Stop hook path.
 11. Add `UserPromptSubmit` handling to reactivate `awaiting_human` loops.
-12. Add `init --install-loop-hook` and the `codex-loop` skill.
-13. Walk the manual fake-Codex verification scenarios (test plan below).
+12. Extend `mergeHook` (optional `timeout`, optional matcher), then add `init --install-loop-hook`
+    (Stop hook with a generous `timeout: 3600` safety net; the loop's internal time budget is the
+    real authority) and the `codex-loop` skill.
+13. Add `node:test` coverage for the pure helpers (command construction, hook decisions, hashes,
+    untracked capture, schema/fence parsing, check/time-budget behavior), then walk the manual
+    fake-Codex verification scenarios (test plan below). Run `npm run build` — the `bin` points at
+    `dist/cli.js` (package.json:6), so the Stop hook runs compiled code and stale `dist` silently
+    masks fixes.
 14. Dogfood in this repo.
 
 ## Test plan
 
-There is no test-runner dependency and no automated suite in the first version — these are **manual
-verification scenarios** run by hand as we build each step, using a fake `codex` binary on `PATH` (a
-small shell script that echoes a canned `review.json` to `--output-last-message`). The logic items
-below are checks to walk through manually against the single-file CLI, not importable test modules.
-An automated runner can come later once the surface stabilizes.
+No third-party test-runner dependency, but the pure logic **is** covered by automated tests using
+Node's built-in `node:test` + `node:assert` (Node 20+, already required by `engines`). The stateful,
+end-to-end hook behavior is verified manually with a fake `codex` binary on `PATH` (a small shell
+script that echoes a canned `review.json` to `--output-last-message`).
+
+Run `npm run build` before any hook end-to-end test: the `bin` points at `dist/cli.js`
+(package.json:6), so the Stop hook executes compiled output and a stale `dist` silently masks your
+changes.
+
+### Automated checks (`node:test`, pure helpers)
+
+- `codexCommand` argument construction from a `CodexInvocation` (schema path set, no `resume`).
+- Hook-decision transitions: `applyReview` (PASS/REVISE/HUMAN/ERROR), `applyNoProgress`, exhausted
+  and stuck paths.
+- Artifact hash + blocker fingerprint: stable across timing noise, moves on real artifact change
+  (including untracked-file content), unchanged on pure rebuttal.
+- `gitUntrackedText` size/binary/secret filtering.
+- Schema parsing and fence/`{...}` extraction of Codex output (valid, fenced, and malformed).
+- Check runner per-check timeout and the internal remaining-time budget.
 
 ### Manual checks (logic)
 
 - Loop state read/write.
 - Plan default criteria.
 - JSON schema validation / parse errors.
-- `gitDiffFull` truncation/redaction (and the `--stat` fallback).
+- `gitDiffFull` truncation/redaction, secret-path exclusion, and the `--stat` fallback.
+- Untracked new-file capture appears in the diff context and in the implement-mode hash.
 - Check runner timeout and output tails.
 - Artifact hash changes in plan mode when the plan file changes.
-- Artifact hash changes in implementation mode when the diff changes.
+- Artifact hash changes in implementation mode when the diff changes or a new file is added.
 - No-progress transitions (no-action and same-blockers paths both feed one `stuckRounds`).
 - HUMAN `awaiting_human` transition.
 - Session-guard no-op.
@@ -1102,11 +1397,14 @@ An automated runner can come later once the surface stabilizes.
 - No active loop → Stop hook stdout empty.
 - Session mismatch → stdout empty.
 - Background tasks present → stdout empty.
+- Scheduled `session_crons` present (no running tasks) → stdout empty (session paused, not done).
 - Failed check → hook blocks and Codex not invoked.
 - Fake Codex REVISE → hook blocks with valid JSON.
 - Fake Codex PASS → hook stdout empty and state `passed`.
 - Fake Codex HUMAN → hook blocks once, then next Stop allows.
 - Fake Codex invalid JSON → fail-open by default, fail-closed blocks.
+- Internal time budget exhausted (slow checks/review) → internal timeout `ERROR`; fail-open allows,
+  fail-closed blocks; the editor never kills the hook first.
 - Max rounds exhausted → state `exhausted`; fail-open allows, fail-closed blocks.
 
 ### Live smoke test
