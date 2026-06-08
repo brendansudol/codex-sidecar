@@ -1,4 +1,4 @@
-# Codex Sidecar Review Gate — v3 Spec
+# Codex Sidecar Gate/Loop Feature Spec
 
 Verified against the installed Codex (`codex-cli 0.137.0`): `codex exec` supports
 `--output-schema`, `--output-last-message`, `--json`, `--sandbox`, `--model`, `--profile`,
@@ -860,17 +860,22 @@ The resulting argument array (argument arrays, never shell strings):
 ```ts
 const args = [
   "exec",
-  "--cd", repo,
-  "--color", "never",
-  "--sandbox", gate.sandbox,            // default read-only
-  "--output-schema", schemaPath,
-  "--output-last-message", reviewJsonPath,
+  "--cd",
+  repo,
+  "--color",
+  "never",
+  "--sandbox",
+  gate.sandbox, // default read-only
+  "--output-schema",
+  schemaPath,
+  "--output-last-message",
+  reviewJsonPath,
   "--json",
 ]
 if (gate.model) args.push("--model", gate.model)
 if (gate.profile) args.push("--profile", gate.profile)
 args.push("-c", `approval_policy=${JSON.stringify(gate.approval)}`)
-args.push("-")                          // prompt on stdin; no `resume` in gate mode
+args.push("-") // prompt on stdin; no `resume` in gate mode
 ```
 
 Send the prompt on stdin (as `runWorker` already does). Enforce `reviewTimeoutSec`. Keep the Codex
@@ -939,9 +944,9 @@ Implementation mode:
 Commands:
 
 - `/codex-gate start ...` → run `codex-sidecar gate start ...`
-- `/codex-gate status`    → run `codex-sidecar gate status`
-- `/codex-gate read`      → run `codex-sidecar gate read`
-- `/codex-gate stop`      → run `codex-sidecar gate stop`
+- `/codex-gate status` → run `codex-sidecar gate status`
+- `/codex-gate read` → run `codex-sidecar gate read`
+- `/codex-gate stop` → run `codex-sidecar gate stop`
 ```
 
 ## Security notes
