@@ -1,4 +1,4 @@
-# Codex Sidecar Gate/Loop Feature Spec
+# Codex Sidecar Loop Feature Spec
 
 Verified against the installed Codex (`codex-cli 0.137.0`): `codex exec` supports
 `--output-schema`, `--output-last-message`, `--json`, `--sandbox`, `--model`, `--profile`,
@@ -8,16 +8,16 @@ Verified against the installed Codex (`codex-cli 0.137.0`): `codex exec` support
 
 ## Executive summary
 
-Add an opt-in `gate` feature to the existing TypeScript `codex-sidecar` CLI.
+Add an opt-in `loop` feature to the existing TypeScript `codex-sidecar` CLI.
 
-The gate lets Claude Code iterate with Codex as a read-only reviewer:
+The loop lets Claude Code iterate with Codex as a read-only reviewer:
 
 ```text
 Claude plans or implements
         ↓
 Claude tries to stop
         ↓
-Claude Code Stop hook invokes  codex-sidecar gate hook stop
+Claude Code Stop hook invokes  codex-sidecar loop hook stop
         ↓
 objective checks run first, when configured
         ↓
@@ -32,27 +32,32 @@ ERROR  → fail-open by default, fail-closed if configured
 ```
 
 This is an **advanced, opt-in quality gate**, not the default background-review workflow. Keep the
-existing `ask` / `read` / `watch` second-opinion flow untouched. Add `gate` for tasks where review
+existing `ask` / `read` / `watch` second-opinion flow untouched. Add `loop` for tasks where review
 gating is worth the latency and control-flow complexity.
 
 ## Design stance
 
 Prefer a small, robust first version:
 
-- One active gate per repo (`default`); named gates can come later.
-- User-facing name is `gate`.
-- Gate mode is explicit: `--mode plan` or `--mode implementation`.
+- One active loop per repo (`default`); named loops can come later.
+- User-facing name is `loop`.
+- Loop mode is explicit: `--mode plan` or `--mode implement`.
 - Plan mode is file-based by default, for a stable review artifact.
 - Implementation mode reviews a full truncated diff, not only `git diff --stat`.
 - Codex output uses `--output-schema` JSON (supported here), with an optional bracketed-block
   parser only as a compatibility fallback for older Codex builds.
-- Codex reviews are fresh per gate round — do **not** use Codex `resume` inside the gate; carry
+- Codex reviews are fresh per loop round — do **not** use Codex `resume` inside the loop; carry
   cross-round memory via injected prior-review summaries instead.
 - Checks run before Codex in implementation mode.
-- The gate's Codex call reuses the existing `prepareRun` / `runWorker` / `codexCommand` path
-  (extended with `--output-schema`), not a parallel spawn — that plumbing is already proven
-  against this Codex build.
-- Stop hook install is explicit: `init --install-claude --install-gate-hook`.
+- The loop's Codex call reuses shared low-level run primitives — a `codexCommand` that takes an
+  explicit `CodexInvocation` spec and a `runCodex` spawn helper — not a parallel spawn. It does
+  **not** route through `ask` / `runWorker`, which carry thread / `resume` / `latest` bookkeeping
+  the loop does not want. See "Shared run-path refactor" below.
+- The loop's prompt builder is composition, not greenfield: it reuses `redact`, `truncate`,
+  `gitContext`, `claudeContext`, plus the new `gitDiffFull`. No reinventing redaction/truncation.
+- Keep everything in the single `src/cli.ts` file — no module split yet, and no test-runner
+  dependency. Verify with the manual smoke tests in the test plan as we build.
+- Stop hook install is explicit: `init --install-claude --install-loop-hook`.
 - Fail-open by default; `--fail-closed` is opt-in.
 
 ## Why not just use the existing background review?
@@ -64,14 +69,14 @@ codex-sidecar ask --claude "Review this plan"
 codex-sidecar read
 ```
 
-Gate reviews are control flow:
+Loop reviews are control flow:
 
 ```text
-Claude cannot finish until configured checks and Codex review pass, or until the gate
+Claude cannot finish until configured checks and Codex review pass, or until the loop
 exhausts / escalates.
 ```
 
-Use the gate for higher-risk work: auth, payments, migrations, CI fixes, large refactors, or
+Use the loop for higher-risk work: auth, payments, migrations, CI fixes, large refactors, or
 plans for non-trivial features.
 
 ## CLI additions
@@ -84,18 +89,18 @@ Normal Claude integration remains non-gating:
 codex-sidecar init --install-claude
 ```
 
-Gate hook install is explicit:
+Loop hook install is explicit:
 
 ```bash
-codex-sidecar init --install-claude --install-gate-hook
+codex-sidecar init --install-claude --install-loop-hook
 ```
 
-This installs a Stop hook that is inert unless a gate is active.
+This installs a Stop hook that is inert unless a loop is active.
 
-### Start a plan gate
+### Start a plan loop
 
 ```bash
-codex-sidecar gate start \
+codex-sidecar loop start \
   --mode plan \
   --max-rounds 3 \
   --plan-file .codex-sidecar/plan.md \
@@ -107,11 +112,11 @@ codex-sidecar gate start \
 
 Plan mode means Claude should plan only, not implement code yet. Codex reviews the plan artifact.
 
-### Start an implementation gate
+### Start an implementation loop
 
 ```bash
-codex-sidecar gate start \
-  --mode implementation \
+codex-sidecar loop start \
+  --mode implement \
   --max-rounds 3 \
   --check "npm run typecheck" \
   --check "npm test -- auth" \
@@ -125,10 +130,10 @@ checks pass.
 ### Manual review
 
 ```bash
-codex-sidecar gate review
+codex-sidecar loop review
 ```
 
-Runs the same gate evaluation manually, without emitting Claude hook JSON. Return codes:
+Runs the same loop evaluation manually, without emitting Claude hook JSON. Return codes:
 
 ```text
 0 = PASS / allowed
@@ -136,24 +141,24 @@ Runs the same gate evaluation manually, without emitting Claude hook JSON. Retur
 2 = ERROR
 ```
 
-This command is important for testing the gate without relying on Stop hooks.
+This command is important for testing the loop without relying on Stop hooks.
 
 ### Status / read / stop
 
 ```bash
-codex-sidecar gate status
-codex-sidecar gate read
-codex-sidecar gate stop
+codex-sidecar loop status
+codex-sidecar loop read
+codex-sidecar loop stop
 ```
 
-`gate stop` deactivates the gate but preserves review artifacts.
+`loop stop` deactivates the loop but preserves review artifacts.
 
 ## Command options
 
-`gate start` options:
+`loop start` options:
 
 ```text
---mode plan|implementation      default implementation
+--mode plan|implement      default implement
 --max-rounds <n>                default 3, clamp 1..7
 --criteria <text>               repeatable
 --check <cmd>                   repeatable; alias --test; implementation mode by default
@@ -172,7 +177,7 @@ codex-sidecar gate stop
 ```
 
 The Claude transcript excerpt is included by default (the existing `ask --claude` behavior);
-`--blind` turns it off. For a first implementation, support a single active gate named `default`.
+`--blind` turns it off. For a first implementation, support a single active loop named `default`.
 
 ## State layout
 
@@ -180,10 +185,10 @@ One active state file plus per-review artifacts, under the existing `.codex-side
 
 ```text
 .codex-sidecar/
-  gate.json
+  loop.json
   latest.md
   claude-session.json
-  gate/
+  loop/
     latest-review.md
     latest-review.json
     reviews/
@@ -204,8 +209,8 @@ One active state file plus per-review artifacts, under the existing `.codex-side
 ## TypeScript types
 
 ```ts
-type GateMode = "plan" | "implementation"
-type GateStatus =
+type LoopMode = "plan" | "implement"
+type LoopStatus =
   | "active"
   | "awaiting_human"
   | "passed"
@@ -213,16 +218,16 @@ type GateStatus =
   | "stuck"
   | "error"
   | "inactive"
-type GateVerdict = "PASS" | "REVISE" | "HUMAN" | "ERROR"
+type LoopVerdict = "PASS" | "REVISE" | "HUMAN" | "ERROR"
 type CriterionStatus = "met" | "not_met" | "unclear" | "not_applicable"
 
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access"
 type ApprovalMode = "never" | "on-request" | "untrusted"
 
-interface GateState {
+interface LoopState {
   version: 1
-  status: GateStatus
-  mode: GateMode
+  status: LoopStatus
+  mode: LoopMode
   task: string
   criteria: string[]
 
@@ -250,7 +255,7 @@ interface GateState {
   armedAt: string
   updatedAt: string
 
-  lastVerdict?: GateVerdict
+  lastVerdict?: LoopVerdict
   lastReviewId?: string
   lastReviewPath?: string
   lastBlockReason?: string
@@ -269,8 +274,8 @@ interface CheckResult {
   timedOut: boolean
 }
 
-interface GateReview {
-  verdict: GateVerdict
+interface LoopReview {
+  verdict: LoopVerdict
   confidence: "high" | "medium" | "low"
   summary: string
 
@@ -321,7 +326,7 @@ Use Codex structured output. Write this schema to `schema.json` and call Codex w
 `--output-schema schema.json` and `--output-last-message review.json`.
 
 ```ts
-const GATE_REVIEW_SCHEMA = {
+const LOOP_REVIEW_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: [
@@ -393,7 +398,7 @@ Plan mode is for iterating on a plan before implementation.
 Start:
 
 ```bash
-codex-sidecar gate start --mode plan --plan-file .codex-sidecar/plan.md <feature request>
+codex-sidecar loop start --mode plan --plan-file .codex-sidecar/plan.md <feature request>
 ```
 
 Claude should inspect the repo and create/update the plan file. Codex reviews that plan file plus
@@ -450,7 +455,7 @@ Current repo context:
 Optional recent Claude transcript excerpt:
 {claudeContext}
 
-Prior gate review summaries:
+Prior loop review summaries:
 {priorReviewSummaries}
 
 Decision rules:
@@ -489,7 +494,7 @@ Implementation mode is for reviewing code changes.
 Start:
 
 ```bash
-codex-sidecar gate start --mode implementation --check "npm test -- auth" <task>
+codex-sidecar loop start --mode implement --check "npm test -- auth" <task>
 ```
 
 ### Implementation prompt template
@@ -525,7 +530,7 @@ Claude's latest assistant message:
 Optional recent Claude transcript excerpt:
 {claudeContext}
 
-Prior gate review summaries:
+Prior loop review summaries:
 {priorReviewSummaries}
 
 Decision rules:
@@ -575,59 +580,59 @@ existing `redact` (cli.ts:890) and `truncate` (cli.ts:883) helpers.
 
 ## Stop hook algorithm
 
-The Stop hook command is `codex-sidecar gate hook stop`. It reads `StopHookInput` on stdin.
+The Stop hook command is `codex-sidecar loop hook stop`. It reads `StopHookInput` on stdin.
 
 ```ts
 async function handleStopHook(input: StopHookInput): Promise<void> {
   const repo = repoRoot(input.cwd ?? process.cwd())
-  const gate = loadGate(repo)
+  const loop = loadLoop(repo)
 
-  if (!gate || gate.status === "inactive" || gate.status === "passed") return allow()
+  if (!loop || loop.status === "inactive" || loop.status === "passed") return allow()
 
-  if (gate.status === "awaiting_human") return allow()
+  if (loop.status === "awaiting_human") return allow()
 
-  if (gate.sessionId && input.session_id && gate.sessionId !== input.session_id) return allow()
+  if (loop.sessionId && input.session_id && loop.sessionId !== input.session_id) return allow()
 
   if (hasRunningBackgroundTasks(input)) return allow()
 
-  if (gate.round >= gate.maxRounds) {
-    updateGate({ ...gate, status: "exhausted" })
-    return gate.failClosed ? block(formatExhaustedReason(gate)) : allow()
+  if (loop.round >= loop.maxRounds) {
+    updateLoop({ ...loop, status: "exhausted" })
+    return loop.failClosed ? block(formatExhaustedReason(loop)) : allow()
   }
 
-  if (gate.mode === "plan" && gate.requirePlanFile && !exists(resolvePlanFile(repo, gate))) {
+  if (loop.mode === "plan" && loop.requirePlanFile && !exists(resolvePlanFile(repo, loop))) {
     return block(
-      `The active Codex plan gate requires a plan file at ${gate.planFile}. ` +
+      `The active Codex plan loop requires a plan file at ${loop.planFile}. ` +
         `Create or update it before finishing.`,
     )
   }
 
   const checkResults =
-    gate.mode === "implementation"
-      ? await runChecks(repo, gate.checks, gate.checkTimeoutSec)
-      : await runOptionalPlanChecks(repo, gate.checks, gate.checkTimeoutSec)
+    loop.mode === "implement"
+      ? await runChecks(repo, loop.checks, loop.checkTimeoutSec)
+      : await runOptionalPlanChecks(repo, loop.checks, loop.checkTimeoutSec)
 
   const failed = checkResults.filter((r) => r.exitCode !== 0 || r.timedOut)
   if (failed.length > 0) {
-    const reason = formatCheckFailureReason(gate, failed)
-    updateGateAfterBlock(gate, {
+    const reason = formatCheckFailureReason(loop, failed)
+    updateLoopAfterBlock(loop, {
       verdict: "REVISE",
-      artifactHash: await computeArtifactHash(repo, gate, input, checkResults),
+      artifactHash: await computeArtifactHash(repo, loop, input, checkResults),
       reason,
     })
     return block(reason)
   }
 
-  const artifactHash = await computeArtifactHash(repo, gate, input, checkResults)
+  const artifactHash = await computeArtifactHash(repo, loop, input, checkResults)
 
   // No-progress short-circuit: artifact unchanged since the last REVISE means Claude did not act.
   // Skip the Codex call, re-issue prior feedback, and feed the single stuck counter (see below).
-  if (gate.lastArtifactHash === artifactHash && gate.lastVerdict === "REVISE") {
-    return applyNoProgress(repo, gate)
+  if (loop.lastArtifactHash === artifactHash && loop.lastVerdict === "REVISE") {
+    return applyNoProgress(repo, loop)
   }
 
-  const review = await runCodexGateReview(repo, gate, input, checkResults)
-  return applyReview(repo, gate, review, artifactHash)
+  const review = await runCodexLoopReview(repo, loop, input, checkResults)
+  return applyReview(repo, loop, review, artifactHash)
 }
 ```
 
@@ -666,15 +671,15 @@ Rules:
   only; the CLI does not rely on it.
 
 ```ts
-function applyNoProgress(repo: string, gate: GateState): HookDecision {
-  const stuckRounds = gate.stuckRounds + 1
+function applyNoProgress(repo: string, loop: LoopState): HookDecision {
+  const stuckRounds = loop.stuckRounds + 1
   if (stuckRounds >= 2) {
-    updateGate({ ...gate, status: "stuck", stuckRounds })
-    return gate.failClosed ? block(formatStuckReason(gate)) : allow()
+    updateLoop({ ...loop, status: "stuck", stuckRounds })
+    return loop.failClosed ? block(formatStuckReason(loop)) : allow()
   }
-  updateGate({ ...gate, stuckRounds })
+  updateLoop({ ...loop, stuckRounds })
   return block(
-    gate.lastBlockReason ?? "No meaningful change since the previous Codex gate feedback.",
+    loop.lastBlockReason ?? "No meaningful change since the previous Codex loop feedback.",
   )
 }
 ```
@@ -684,11 +689,11 @@ function applyNoProgress(repo: string, gate: GateState): HookDecision {
 ```ts
 function applyReview(
   repo: string,
-  gate: GateState,
-  review: GateReview,
+  loop: LoopState,
+  review: LoopReview,
   artifactHash: string,
 ): HookDecision {
-  const nextRound = gate.round + 1
+  const nextRound = loop.round + 1
   const blockerFingerprint = hash(normalizeBlockers(review.blockers))
   saveReviewArtifacts(review)
 
@@ -696,8 +701,8 @@ function applyReview(
     review.verdict === "PASS" &&
     review.blockers.filter((b) => b.severity !== "minor").length === 0
   ) {
-    updateGate({
-      ...gate,
+    updateLoop({
+      ...loop,
       status: "passed",
       round: nextRound,
       lastVerdict: "PASS",
@@ -707,43 +712,43 @@ function applyReview(
   }
 
   if (review.verdict === "HUMAN") {
-    const reason = formatHumanReason(gate, review)
-    updateGate({ ...gate, status: "awaiting_human", lastVerdict: "HUMAN", lastBlockReason: reason })
+    const reason = formatHumanReason(loop, review)
+    updateLoop({ ...loop, status: "awaiting_human", lastVerdict: "HUMAN", lastBlockReason: reason })
     return block(reason)
   }
 
   if (review.verdict === "ERROR") {
-    updateGate({ ...gate, status: "error", lastVerdict: "ERROR", lastError: review.summary })
-    return gate.failClosed ? block(formatErrorReason(gate, review)) : allow()
+    updateLoop({ ...loop, status: "error", lastVerdict: "ERROR", lastError: review.summary })
+    return loop.failClosed ? block(formatErrorReason(loop, review)) : allow()
   }
 
-  if (nextRound >= gate.maxRounds) {
-    const reason = formatMaxRoundsReason(gate, review)
-    updateGate({
-      ...gate,
+  if (nextRound >= loop.maxRounds) {
+    const reason = formatMaxRoundsReason(loop, review)
+    updateLoop({
+      ...loop,
       status: "exhausted",
       round: nextRound,
       lastVerdict: review.verdict,
       lastBlockReason: reason,
     })
-    return gate.failClosed ? block(reason) : allow()
+    return loop.failClosed ? block(reason) : allow()
   }
 
   // REVISE: single stuck counter — bump if the same blockers recur, reset on real progress.
-  const stuckRounds = gate.lastBlockerFingerprint === blockerFingerprint ? gate.stuckRounds + 1 : 0
+  const stuckRounds = loop.lastBlockerFingerprint === blockerFingerprint ? loop.stuckRounds + 1 : 0
   if (stuckRounds >= 2) {
-    const reason = formatStuckReason(gate)
-    updateGate({ ...gate, status: "stuck", round: nextRound, lastVerdict: "REVISE", stuckRounds })
-    return gate.failClosed ? block(reason) : allow()
+    const reason = formatStuckReason(loop)
+    updateLoop({ ...loop, status: "stuck", round: nextRound, lastVerdict: "REVISE", stuckRounds })
+    return loop.failClosed ? block(reason) : allow()
   }
 
   const reason =
-    gate.mode === "plan"
-      ? formatPlanReviseReason(gate, review, nextRound)
-      : formatImplementationReviseReason(gate, review, nextRound)
+    loop.mode === "plan"
+      ? formatPlanReviseReason(loop, review, nextRound)
+      : formatImplementReviseReason(loop, review, nextRound)
 
-  updateGate({
-    ...gate,
+  updateLoop({
+    ...loop,
     status: "active",
     round: nextRound,
     lastVerdict: "REVISE",
@@ -760,7 +765,7 @@ function applyReview(
 ## Block reason formatting
 
 Keep hook block reasons concise (the Stop hook `reason` is capped at ~10,000 chars). Save full
-details to `gate/reviews/<id>/review.md`.
+details to `loop/reviews/<id>/review.md`.
 
 ### Plan revise
 
@@ -848,42 +853,107 @@ Output tail:
 Claude should fix the failing verification command, rerun it, and then try to finish again.
 ```
 
-## Codex command
+## Shared run-path refactor
 
-Reuse the existing run path: build the gate review as a `RunMeta` and execute it through the
-shared `prepareRun` / `runWorker` helpers (§build order), extending `codexCommand` (cli.ts:575)
-with `--output-schema`. Approval is `-c approval_policy=<mode>` — **not** `--ask-for-approval`,
-which `codex exec` 0.137.0 does not support.
+The loop's Codex call and the existing `ask` path share only their lowest level: turning a spec into
+a `codex exec` argument array, and spawning Codex with the prompt on stdin. They do **not** share run
+preparation — `ask()` (cli.ts:379) inlines thread-oriented setup (`buildPrompt`, `setLatestRun`,
+thread turns, `resume`) the loop has no use for. So rather than routing the loop through `ask` /
+`runWorker`, extract the two shared primitives below and give the loop its own artifact prep.
 
-The resulting argument array (argument arrays, never shell strings):
+### `codexCommand` takes a `CodexInvocation`
+
+`codexCommand(meta: RunMeta, sessionId?)` (cli.ts:575) currently reads loop-irrelevant fields
+(`fresh`, `thread`, `includeClaude`). Refactor it to take a small spec so neither caller has to fake
+a `RunMeta` or thread call-specific fields through it:
 
 ```ts
-const args = [
-  "exec",
-  "--cd",
-  repo,
-  "--color",
-  "never",
-  "--sandbox",
-  gate.sandbox, // default read-only
-  "--output-schema",
-  schemaPath,
-  "--output-last-message",
-  reviewJsonPath,
-  "--json",
-]
-if (gate.model) args.push("--model", gate.model)
-if (gate.profile) args.push("--profile", gate.profile)
-args.push("-c", `approval_policy=${JSON.stringify(gate.approval)}`)
-args.push("-") // prompt on stdin; no `resume` in gate mode
+interface CodexInvocation {
+  repo: string
+  sandbox: string
+  approval: string
+  answerPath: string          // --output-last-message
+  model?: string
+  profile?: string
+  skipGitCheck?: boolean
+  extraConfig?: string[]      // -c key=value
+  outputSchemaPath?: string   // --output-schema   (loop sets this; ask does not)
+  resumeSessionId?: string    // resume <id>        (ask sets this; loop never does)
+}
+
+function codexCommand(inv: CodexInvocation): string[] {
+  const cmd = ["codex", "exec", "--cd", inv.repo, "--color", "never", "--sandbox", inv.sandbox,
+    "--output-last-message", inv.answerPath, "--json"]
+  if (inv.outputSchemaPath) cmd.push("--output-schema", inv.outputSchemaPath)
+  if (inv.model) cmd.push("--model", inv.model)
+  if (inv.profile) cmd.push("--profile", inv.profile)
+  if (inv.skipGitCheck) cmd.push("--skip-git-repo-check")
+  for (const item of inv.extraConfig ?? []) cmd.push("-c", item)
+  cmd.push("-c", `approval_policy=${JSON.stringify(inv.approval)}`)
+  if (inv.resumeSessionId) cmd.push("resume", inv.resumeSessionId)
+  cmd.push("-") // prompt on stdin
+  return cmd
+}
 ```
 
-Send the prompt on stdin (as `runWorker` already does). Enforce `reviewTimeoutSec`. Keep the Codex
-sandbox `read-only` by default and do not use `resume`.
+`runWorker` builds a `CodexInvocation` from `meta` + `sessionId`; the loop builds one with
+`outputSchemaPath` set and `resumeSessionId` left undefined. Approval stays `-c approval_policy=<mode>`
+— **not** `--ask-for-approval`, which `codex exec` 0.137.0 does not support.
+
+### `runCodex` — the spawn core
+
+Extract the `spawnSync` block currently in `runWorker` (cli.ts:540, which has no timeout today),
+adding an optional timeout:
+
+```ts
+interface CodexResult { status: number | null; stdout: string; stderr: string; timedOut: boolean; error?: Error }
+
+function runCodex(args: string[], input: string, cwd: string, timeoutMs?: number): CodexResult {
+  const r = spawnSync(args[0], args.slice(1), {
+    cwd, input, encoding: "utf8", timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024,
+  })
+  return {
+    status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "",
+    timedOut: (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT",
+    error: r.error,
+  }
+}
+```
+
+`timeoutMs` is optional and **must stay optional**: `runWorker` passes `undefined` to preserve
+today's no-timeout behavior for background reviews (imposing a default cap could truncate long but
+legitimate `ask` reviews). Only the loop passes `reviewTimeoutSec * 1000`.
+
+### Loop-local artifact prep
+
+The loop sets up its own per-review directory — distinct from the `runs/` layout, with no thread
+pointers. A `saveReviewArtifacts` helper (referenced in "Applying reviews") creates
+`loop/reviews/<id>/` and writes `prompt.md`, `schema.json`, `review.json`, `review.md`,
+`codex.ndjson`, `stderr.txt`, `checks.json`, `meta.json`, then refreshes
+`loop/latest-review.{md,json}`.
+
+### Loop review execution
+
+The loop review therefore: builds its prompt (composition — see below), writes `schema.json`,
+constructs a `CodexInvocation` with `outputSchemaPath = schemaPath` and `answerPath = reviewJsonPath`,
+calls `runCodex(codexCommand(inv), prompt, repo, loop.reviewTimeoutSec * 1000)`, persists
+`stdout → codex.ndjson` / `stderr → stderr.txt`, parses `review.json` against the schema, and saves
+artifacts. Sandbox stays `read-only` by default; no `resume`.
+
+### Loop prompt builder
+
+The plan and implementation prompt builders assemble the templates above by reusing existing helpers,
+not by reimplementing them:
+
+- `redact` (cli.ts:890) on every transcript/diff/file body before it enters the prompt.
+- `truncate` (cli.ts:883) for size budgets.
+- `gitContext` (cli.ts:483) for `{gitStatus}`.
+- `claudeContext` (cli.ts:501) for the `{claudeContext}` transcript excerpt (skipped when `--blind`).
+- the new `gitDiffFull` for `{gitDiffFull}` in implementation mode.
 
 ## Hook registration
 
-`init --install-claude --install-gate-hook` should merge, not clobber, settings (reuse the
+`init --install-claude --install-loop-hook` should merge, not clobber, settings (reuse the
 existing `mergeHook`, cli.ts:770):
 
 ```json
@@ -894,7 +964,7 @@ existing `mergeHook`, cli.ts:770):
         "hooks": [
           {
             "type": "command",
-            "command": "codex-sidecar gate hook stop",
+            "command": "codex-sidecar loop hook stop",
             "timeout": 900
           }
         ]
@@ -906,29 +976,29 @@ existing `mergeHook`, cli.ts:770):
 
 `Stop` has no matcher support, so omit the matcher (the existing `mergeHook` tolerates a `"*"`
 matcher if its shape requires one). Keep the existing SessionStart / UserPromptSubmit capture
-hooks, and extend the `UserPromptSubmit` path to flip an `awaiting_human` gate back to `active`
+hooks, and extend the `UserPromptSubmit` path to flip an `awaiting_human` loop back to `active`
 when the user replies.
 
 ## Claude skill
 
-Install `.claude/skills/codex-gate/SKILL.md`:
+Install `.claude/skills/codex-loop/SKILL.md`:
 
 ```md
 ---
-name: codex-gate
+name: codex-loop
 description: Start, inspect, or stop a Codex review gate that blocks Claude from finishing until checks and Codex review pass. Use for high-risk implementation work or for iterating on a plan before code is written.
 disable-model-invocation: true
-allowed-tools: Bash(codex-sidecar gate *) Read(.codex-sidecar/gate.json) Read(.codex-sidecar/gate/latest-review.md) Read(.codex-sidecar/plan.md)
+allowed-tools: Bash(codex-sidecar loop *) Read(.codex-sidecar/loop.json) Read(.codex-sidecar/loop/latest-review.md) Read(.codex-sidecar/plan.md)
 ---
 
-# Codex Gate
+# Codex Loop
 
-Use `codex-sidecar gate ...`.
+Use `codex-sidecar loop ...`.
 
 Plan mode:
 
 - Use when the user wants to iterate on a plan before implementation.
-- Start with `codex-sidecar gate start --mode plan ...`.
+- Start with `codex-sidecar loop start --mode plan ...`.
 - Create or update the configured plan file.
 - Do not implement code unless the user explicitly asks.
 - If the Stop hook blocks, revise the plan using Codex feedback.
@@ -937,16 +1007,16 @@ Plan mode:
 Implementation mode:
 
 - Use when the user wants code changes gated by checks and Codex review.
-- Start with `codex-sidecar gate start --mode implementation ...`.
+- Start with `codex-sidecar loop start --mode implement ...`.
 - When the Stop hook blocks, fix concrete blockers, run checks, and try to finish again.
 - Treat Codex feedback as advisory but important; if a finding is wrong, explain why with file evidence.
 
 Commands:
 
-- `/codex-gate start ...` → run `codex-sidecar gate start ...`
-- `/codex-gate status` → run `codex-sidecar gate status`
-- `/codex-gate read` → run `codex-sidecar gate read`
-- `/codex-gate stop` → run `codex-sidecar gate stop`
+- `/codex-loop start ...` → run `codex-sidecar loop start ...`
+- `/codex-loop status` → run `codex-sidecar loop status`
+- `/codex-loop read` → run `codex-sidecar loop read`
+- `/codex-loop stop` → run `codex-sidecar loop stop`
 ```
 
 ## Security notes
@@ -966,11 +1036,11 @@ Codex not found, timeout, invalid JSON, or schema failure:
 - Save raw stdout/stderr/final output.
 - Write an ERROR review artifact.
 - If `failClosed`, block with a concise error and tell Claude to ask the user.
-- Otherwise allow stop and mark the gate `error`.
+- Otherwise allow stop and mark the loop `error`.
 
 Invalid hook input JSON:
 
-- Log to `.codex-sidecar/gate/hook-errors.log`.
+- Log to `.codex-sidecar/loop/hook-errors.log`.
 - Exit 0 silently.
 
 ## Optional `/goal` prototype
@@ -982,35 +1052,41 @@ Before coding, or when tuning prompts, prototype the workflow manually with Clau
 findings, and either Codex passes or four rounds have elapsed.
 ```
 
-This is not a replacement for the gate — `/goal`'s evaluator cannot run commands or inspect files
+This is not a replacement for the loop — `/goal`'s evaluator cannot run commands or inspect files
 itself, so Claude must surface each review in the transcript — but it validates the workflow wording
 cheaply.
 
 ## Build order
 
-1. Add state helpers for `.codex-sidecar/gate.json` and review artifacts.
-2. Add `gate start / status / read / stop`.
+1. Add state helpers for `.codex-sidecar/loop.json` and review artifacts.
+2. Add `loop start / status / read / stop`.
 3. Add plan-file support and default plan criteria.
 4. Add the check runner with timeout and output tails.
 5. Add the `gitDiffFull` helper (plain diff, redaction, truncation; `--stat`/`--name-status` fallback).
 6. Add artifact-hash and blocker-fingerprint helpers.
 7. Add prompt builders for plan and implementation modes.
-8. Extract `prepareRun(repo, opts)` from `ask()` and extend `codexCommand` with `--output-schema`;
-   add the `GateReview` schema and the structured Codex runner on top of `runWorker`.
-9. Add the `gate review` manual path (exit codes 0/1/2).
-10. Add the `gate hook stop` Stop hook path.
-11. Add `UserPromptSubmit` handling to reactivate `awaiting_human` gates.
-12. Add `init --install-gate-hook` and the `codex-gate` skill.
-13. Add fake-Codex tests.
+8. Refactor `codexCommand` to take a `CodexInvocation` spec (decoupled from `RunMeta`); extract
+   `runCodex` (the `spawnSync` core, optional timeout) from `runWorker`; rewire `runWorker` onto
+   both. Then add the `LoopReview` schema, the loop-local `saveReviewArtifacts` helper, and the
+   structured loop runner built on `codexCommand` + `runCodex` (not `runWorker`).
+9. Add the `loop review` manual path (exit codes 0/1/2).
+10. Add the `loop hook stop` Stop hook path.
+11. Add `UserPromptSubmit` handling to reactivate `awaiting_human` loops.
+12. Add `init --install-loop-hook` and the `codex-loop` skill.
+13. Walk the manual fake-Codex verification scenarios (test plan below).
 14. Dogfood in this repo.
 
 ## Test plan
 
-Use a fake `codex` binary on `PATH`.
+There is no test-runner dependency and no automated suite in the first version — these are **manual
+verification scenarios** run by hand as we build each step, using a fake `codex` binary on `PATH` (a
+small shell script that echoes a canned `review.json` to `--output-last-message`). The logic items
+below are checks to walk through manually against the single-file CLI, not importable test modules.
+An automated runner can come later once the surface stabilizes.
 
-### Unit tests
+### Manual checks (logic)
 
-- Gate state read/write.
+- Loop state read/write.
 - Plan default criteria.
 - JSON schema validation / parse errors.
 - `gitDiffFull` truncation/redaction (and the `--stat` fallback).
@@ -1021,9 +1097,9 @@ Use a fake `codex` binary on `PATH`.
 - HUMAN `awaiting_human` transition.
 - Session-guard no-op.
 
-### Integration tests
+### Manual checks (hook end-to-end)
 
-- No active gate → Stop hook stdout empty.
+- No active loop → Stop hook stdout empty.
 - Session mismatch → stdout empty.
 - Background tasks present → stdout empty.
 - Failed check → hook blocks and Codex not invoked.
@@ -1035,59 +1111,43 @@ Use a fake `codex` binary on `PATH`.
 
 ### Live smoke test
 
-Toy plan gate:
+Toy plan loop:
 
 ```bash
-codex-sidecar gate start --mode plan --max-rounds 2 --plan-file .codex-sidecar/plan.md add a README section
+codex-sidecar loop start --mode plan --max-rounds 2 --plan-file .codex-sidecar/plan.md add a README section
 ```
 
-Toy implementation gate:
+Toy implementation loop:
 
 ```bash
-codex-sidecar gate start --mode implementation --max-rounds 2 --check "grep -q LOOP_OK README.md" add LOOP_OK to README
+codex-sidecar loop start --mode implement --max-rounds 2 --check "grep -q LOOP_OK README.md" add LOOP_OK to README
 ```
 
 ## Non-goals for the first version
 
-- Multiple active gates.
+- Multiple active loops.
 - Autonomous code editing by Codex.
 - PR comments.
 - Remote workers.
 - Web UI.
 - Automatic test selection.
 - Sophisticated scoring/evals.
-- Persistent Codex `resume` inside gate mode.
-- Carrying an approved plan automatically into an implementation gate (plan → implement pipeline).
+- Persistent Codex `resume` inside loop mode.
+- Carrying an approved plan automatically into an implementation loop (plan → implement pipeline).
 
-## Final recommendation
+## First-version scope
 
 ```text
-v1: one active, opt-in gate
+One active, opt-in loop:
   - plan mode
   - implementation mode
   - schema-based Codex review (--output-schema)
   - check/test before Codex
-  - single Stop hook command (codex-sidecar gate hook stop)
+  - single Stop hook command (codex-sidecar loop hook stop)
   - session guard
   - fail-open default
-  - reuse of prepareRun / runWorker / codexCommand / redact / truncate / mergeHook
+  - reuse of codexCommand (spec-based) / runCodex / redact / truncate / gitContext /
+    claudeContext / mergeHook (loop runs on the low-level primitives, not ask / runWorker)
 ```
 
 Add fancier loop concepts only after this simple version is stable.
-
----
-
-## Changes from v2
-
-- `codex-sidebar` → `codex-sidecar` everywhere (bin, examples, state dir, skill, hook command).
-- Codex approval uses `-c approval_policy=<mode>`; removed `--ask-for-approval` (unsupported by
-  `codex exec` 0.137.0). Verified `--output-schema` is supported, so schema review stays primary.
-- Gate Codex call reuses the existing `prepareRun` / `runWorker` / `codexCommand` path (extended
-  with `--output-schema`) instead of a parallel `spawn`; reuses `redact`, `truncate`, `mergeHook`,
-  `addLocalGitExclude`.
-- `gitDiffFull` drops `--binary` (plain text diff only).
-- Removed references to not-yet-built surface: `./tools/codex-sidecar` wrapper → the linked
-  `codex-sidecar` bin; dropped the nonexistent `follow` command; `--claude-context` → the existing
-  `--claude` behavior (on by default, `--blind` to disable).
-- No-progress collapsed to a single `stuckRounds` counter with explicit increment/reset rules
-  (no-action path and same-blockers path both feed it); removed the duplicate stuck bookkeeping.
