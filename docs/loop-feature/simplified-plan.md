@@ -48,7 +48,8 @@ Build only:
 - `loop start`, `loop review`, `loop status`, `loop read`, `loop stop`
 - `loop hook stop` for Claude Code Stop hooks
 - configured checks before Codex review
-- full working-tree diff review, including staged and untracked text files
+- tracked working-tree diff review, including staged and unstaged changes
+- untracked files listed by path only
 - structured Codex output via `--output-schema`
 - fail-open behavior for Codex/tooling errors
 - a hardcoded total timeout budget per Stop evaluation
@@ -70,6 +71,7 @@ Defer:
 - `--fail-closed`
 - `--blind`
 - full Claude transcript excerpts
+- untracked text-file content capture
 - `--sandbox`, `--approval`, `--profile`, and arbitrary Codex config
 - compatibility parser for older Codex versions without `--output-schema`
 - Claude `/codex-loop` skill
@@ -125,6 +127,11 @@ If a Claude session has already been captured, the MVP binds the loop to that
 session internally. If no session has been captured, the loop applies to any
 session in the repo and prints a warning at `loop start`.
 
+If `.codex-sidecar/loop.json` already exists with `status: "active"`,
+`loop start` fails and tells the user to run `codex-sidecar loop stop` first.
+Starting a new loop may replace prior `passed`, `exhausted`, `error`, or
+`inactive` state while preserving existing review artifacts.
+
 No `--mode` in the MVP. The loop is implementation-only. If users want plan
 review, they can keep using:
 
@@ -140,6 +147,10 @@ codex-sidecar loop review
 
 Runs the same evaluation as the Stop hook, but prints a human-readable result
 instead of Claude hook JSON.
+
+For simplicity, manual review mutates loop state exactly like the Stop hook: a
+`REVISE` result or failed check increments `round`, and repeated manual reviews
+can exhaust the loop.
 
 Exit codes:
 
@@ -234,6 +245,7 @@ interface StopHookInput {
   session_id?: string
   cwd?: string
   hook_event_name?: "Stop" | string
+  stop_hook_active?: boolean
   last_assistant_message?: string
   background_tasks?: Array<{
     status?: string
@@ -381,20 +393,21 @@ background-review behavior. The loop passes the remaining evaluation budget.
 
 ## Diff Capture
 
-Keep full diff capture in the MVP. It is core review quality, not optional
-machinery.
+Keep full tracked diff capture in the MVP. It is core review quality, not
+optional machinery. Do not read untracked file contents in the MVP; list
+untracked paths only.
 
 Requirements:
 
-- include unstaged diff
-- include staged diff
-- include text content for untracked files
-- exclude secret-looking paths before reading content
-- skip large or binary untracked files
-- redact before prompt assembly
+- include unstaged tracked diff
+- include staged tracked diff
+- list untracked files by path only
+- honor `.gitignore` and standard Git excludes when listing untracked files
+- exclude secret-looking paths from diff, status, and untracked path output
+- redact the final assembled prompt before Codex invocation
 - truncate final diff context
 - if full diff capture fails, fall back to summary output for both unstaged and
-  staged changes
+  staged changes, plus the untracked path list if available
 
 Secret path exclusions:
 
@@ -407,10 +420,26 @@ const SECRET_PATHSPECS = [
   ":(exclude)**/*.pem",
   ":(exclude)**/*.key",
   ":(exclude)**/id_rsa*",
+  ":(exclude)**/.ssh/**",
+  ":(exclude)**/.npmrc",
+  ":(exclude)**/.netrc",
   ":(exclude)**/*.p12",
   ":(exclude)**/*.pfx",
   ":(exclude)**/secrets/**",
 ]
+```
+
+Untracked files are listed with Git's standard ignore handling:
+
+```ts
+const untrackedNames = runCapture("git", [
+  "ls-files",
+  "--others",
+  "--exclude-standard",
+  "--",
+  ".",
+  ...SECRET_PATHSPECS,
+], { cwd: repo })
 ```
 
 Fallback must include staged summaries too:
@@ -422,8 +451,8 @@ const stagedStat = runCapture("git", ["diff", "--cached", "--stat", "--", ".", .
 const stagedNames = runCapture("git", ["diff", "--cached", "--name-status", "--", ".", ...SECRET_PATHSPECS], { cwd: repo })
 ```
 
-Untracked capture should read at most 100 files, skip files larger than 256 KiB,
-and skip buffers containing NUL bytes.
+Do not add size checks, binary sniffing, or text reads for untracked files in the
+MVP because untracked content capture is deferred.
 
 ## Prompt Template
 
@@ -449,7 +478,7 @@ Configured check results:
 Current git status:
 {gitStatus}
 
-Full working-tree diff, truncated and redacted:
+Tracked working-tree diff and untracked paths, truncated and redacted:
 {gitDiffFull}
 
 Claude's latest assistant message:
@@ -488,7 +517,8 @@ Hook algorithm:
 
 ```ts
 function handleStopHook(input: StopHookInput): void {
-  const repo = repoRoot(input.cwd ?? process.cwd())
+  const cwd = input.cwd ?? process.cwd()
+  const repo = repoRoot(false, cwd)
   const loop = loadLoop(repo)
 
   if (!loop || loop.status !== "active") return allow()
@@ -514,6 +544,11 @@ function handleStopHook(input: StopHookInput): void {
 ```
 
 `allow()` writes nothing to stdout and exits 0.
+
+Parse `stop_hook_active` from the hook input and include it in review artifacts
+or diagnostic metadata. Do not allow solely because `stop_hook_active` is true:
+Claude may be retrying after a prior loop block, and the MVP's
+`LOOP_MAX_ROUNDS` cap is the protection against indefinite stop-hook cycling.
 
 `block(reason)` writes:
 
@@ -658,32 +693,32 @@ the advisory `ask` workflow.
 3. Refactor `codexCommand` to accept `CodexInvocation`.
 4. Extract `runCodex` and rewire `runWorker` through it.
 5. Add the check runner with a single hardcoded total deadline.
-6. Add `runCapture`, secret path exclusions, untracked capture, and full diff
-   capture with staged fallback summaries.
+6. Add `runCapture`, secret path exclusions, untracked path listing, and full
+   tracked diff capture with staged fallback summaries.
 7. Add the simplified review schema and implementation prompt builder.
 8. Add loop-local review artifact writing.
 9. Add `loop review`.
 10. Add `loop hook stop`.
 11. Extend `mergeHook` and add `init --install-loop-hook`.
-12. Add focused `node:test` coverage.
-13. Run `npm run check` and `npm run build`.
+12. Run `npm run check` and `npm run build`.
+13. Run manual fake-Codex and hook end-to-end checks.
 14. Dogfood in this repo before adding deferred scope.
 
 ## Test Plan
 
-Use Node's built-in `node:test` and `node:assert`. Add a `test` script when the
-first tests are introduced.
+Do not add automated test infrastructure for the MVP. Verify the feature with
+manual checks and end-to-end hook testing after the implementation is built.
 
-Automated tests:
+Manual CLI and helper checks:
 
 - `codexCommand` constructs schema-based loop invocation with no `resume`.
 - `runCodex` preserves no-timeout behavior when timeout is undefined.
 - `runCodex` reports timeout when timeout expires.
 - check runner uses the remaining total deadline.
-- `gitUntrackedText` captures small text files.
-- `gitUntrackedText` skips binary, large, and secret-looking files.
-- `gitDiffFull` includes unstaged, staged, and untracked content.
-- `gitDiffFull` fallback includes both unstaged and staged summaries.
+- `gitUntrackedPaths` lists untracked files with `--exclude-standard`.
+- `gitUntrackedPaths` excludes secret-looking paths and never reads file content.
+- `gitDiffFull` includes unstaged and staged tracked diffs plus untracked paths.
+- `gitDiffFull` fallback includes both unstaged and staged summaries plus untracked paths when available.
 - Stop hook allows when no active loop exists.
 - Stop hook allows session mismatch.
 - Stop hook allows paused sessions with background tasks or session crons.
@@ -693,13 +728,21 @@ Automated tests:
 - Codex invalid JSON marks error and allows.
 - `LOOP_MAX_ROUNDS` exhaustion marks the loop exhausted and allows on the next Stop.
 
-Manual fake-Codex checks:
+Manual fake-Codex and hook end-to-end checks:
 
 - fake Codex writes `PASS` JSON to `--output-last-message`.
 - fake Codex writes `REVISE` JSON.
 - fake Codex writes malformed JSON.
 - fake check command fails.
 - fake check command times out.
+- no active loop allows Stop with empty stdout.
+- session mismatch allows Stop with empty stdout.
+- paused session with background tasks or session crons allows Stop with empty stdout.
+- failed checks block and do not invoke fake Codex.
+- fake Codex `PASS` marks the loop passed and allows Stop.
+- fake Codex `REVISE` increments the round and blocks Stop with valid hook JSON.
+- fake Codex malformed JSON marks error and allows Stop.
+- max-round exhaustion marks the loop exhausted and allows Stop on the next evaluation.
 
 Before hook end-to-end testing, run:
 
@@ -720,6 +763,7 @@ Add only after the MVP is stable:
 - `--fail-closed`
 - `--sandbox`, `--approval`, `--profile`, arbitrary Codex config
 - optional full Claude transcript context
+- optional untracked text-file content capture
 - Claude `/codex-loop` skill
 - multiple named loops
 - richer criteria tracking
