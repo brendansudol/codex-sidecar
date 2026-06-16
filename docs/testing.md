@@ -196,3 +196,44 @@ Troubleshooting:
 - If Claude does not find `/codex-opinion`, reload Claude Code.
 - If hooks do not run, verify `.claude/settings.local.json` and make sure Claude Code can resolve `codex-sidecar` on its `PATH`.
 - If `--claude` prompts say no transcript was captured, trigger a new prompt in Claude Code and rerun `codex-sidecar doctor`.
+
+## Prompt Templates
+
+List templates:
+
+```bash
+codex-sidecar templates
+```
+
+Expected: the four built-ins (`review`, `plan-review`, `diff-review`, `bug-hypothesis`), each with a
+description. Templates with a built-in default question are marked `[standalone]`.
+
+Run a built-in template with no question (uses its default question):
+
+```bash
+codex-sidecar ask -t tmpl-smoke --template diff-review --wait
+```
+
+Expected: the run completes; `prompt.md` opens with the diff-review role block, and the final
+`# User question for Codex` chunk is the diff-review default question.
+
+Error paths (all should exit non-zero without starting a run):
+
+```bash
+codex-sidecar ask --template bogus "q"        # unknown template, lists available
+codex-sidecar ask --template ../evil "q"      # invalid name (traversal guard)
+codex-sidecar ask --template review           # review has no default question
+```
+
+Local override:
+
+```bash
+mkdir -p .codex-sidecar/templates
+printf -- '---\ndescription: my override\n---\nCustom intro for {{repo}}.\n' > .codex-sidecar/templates/diff-review.md
+codex-sidecar templates            # diff-review shows "(overrides built-in)"
+```
+
+Expected: `codex-sidecar templates` lists the override with `(overrides built-in)`, and an
+`ask --template diff-review ...` prompt now starts with the custom body. Remove the file to restore the
+built-in. An undefined or malformed `{{placeholder}}` (including `{{{repo}}}`) in a template body
+fails with `unknown or malformed template placeholder(s)`.

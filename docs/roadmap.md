@@ -128,6 +128,9 @@ Open questions:
 
 ## 6. Prompt Template System
 
+> Status: v1 implemented. See [docs/plans/prompt-templates.md](plans/prompt-templates.md) for the
+> design and what was deferred (remaining built-ins, `init --templates`, shared template path, `-T`).
+
 Add a better prompt template system.
 
 Goals:

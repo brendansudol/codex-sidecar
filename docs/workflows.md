@@ -674,6 +674,74 @@ Do not modify files.
 "
 ```
 
+## Prompt Templates
+
+Most of the workflows above start with the same kind of instruction: "act as a skeptical reviewer of
+X, focus on Y, return verdict/evidence/risks." Templates package those recurring shapes so you do not
+retype them.
+
+A template customizes **only the leading role/instructions block** of the prompt. The sidecar still
+assembles git context, prior side-thread turns, optional Claude context, extra context files, and your
+question (always appended last) exactly as before. Templates are orthogonal to `--claude`, `--fresh`,
+threads, and `--context-file`.
+
+List what is available:
+
+```bash
+codex-sidecar templates
+```
+
+Built-in templates map onto the workflows above:
+
+| Template | Encodes | Default question? |
+|---|---|---|
+| `review` | Default. Candid second opinion (verdict / evidence / risks / next steps). | No |
+| `plan-review` | Workflow 1/7 — skeptical staff-engineer plan review. | Yes |
+| `diff-review` | Workflow 3/8 — strict PR / pre-commit diff review, blocking issues first. | Yes |
+| `bug-hypothesis` | Workflow 2 — independently verify a suspected root cause. | Yes |
+
+Use one:
+
+```bash
+# With your own question:
+codex-sidecar ask --template plan-review --claude "Review the auth refactor plan."
+
+# With no question — the template's built-in default question is used:
+codex-sidecar ask --template diff-review
+```
+
+`review` has no default question, so it always requires one (this is the default behavior when you pass
+no `--template` at all). The other built-ins stand alone.
+
+### Local and custom templates
+
+Drop a markdown file at `.codex-sidecar/templates/<name>.md` to add a new template or override a
+built-in of the same name. This location is local to your checkout (`.codex-sidecar/` is git-excluded),
+so overrides are personal, not shared with your team.
+
+```markdown
+---
+description: Security pass focused on authorization boundaries
+defaultQuestion: Audit this change for authorization and tenant-boundary mistakes.
+---
+You are OpenAI Codex acting as an application security reviewer for {{repo}} (thread: {{thread}}).
+
+Assume a malicious tenant. Look for authorization mistakes, missing tenant scoping, and
+information-disclosure differences (for example 403 vs 404). Cite file paths and line numbers.
+Do not modify files.
+
+Answer format: verdict, findings ranked by severity, concrete fixes.
+```
+
+Notes:
+
+- Supported variables in the body: `{{repo}}`, `{{thread}}`, `{{date}}`. An unknown `{{placeholder}}`
+  is a hard error (caught before the background run starts), so typos fail loudly.
+- Frontmatter is optional and deliberately minimal: only `description` and `defaultQuestion`, one value
+  per line. It is not full YAML.
+- `description` shows up in `codex-sidecar templates`; `defaultQuestion` is used only when you give no
+  free-text question.
+
 ## Where This Is Most Useful
 
 Strong use cases:

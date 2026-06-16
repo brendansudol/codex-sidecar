@@ -75,6 +75,19 @@ codex-sidecar read -t auth-refactor
 codex-sidecar clear -t auth-refactor
 ```
 
+Use a prompt template to skip retyping common instructions:
+
+```bash
+codex-sidecar templates                                  # list built-in + local templates
+codex-sidecar ask --template diff-review                 # uses the template's default question
+codex-sidecar ask --template plan-review --claude "Review this migration plan."
+```
+
+A template only shapes the leading role/instructions block; git context, prior turns, Claude
+context, and your question are still assembled as usual. Built-ins: `review` (default),
+`plan-review`, `diff-review`, `bug-hypothesis`. Override any of them, or add your own, by dropping
+a markdown file at `.codex-sidecar/templates/<name>.md` (local to your checkout).
+
 Run synchronously:
 
 ```bash
@@ -100,6 +113,7 @@ Claude should call `codex-sidecar ask --claude ...`, continue working, and later
   latest.md
   latest-default
   claude-session.json
+  templates/<name>.md               # optional local prompt templates (override built-ins)
   threads/default.json
   runs/<run-id>/
     metadata.json
